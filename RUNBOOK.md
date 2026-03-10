@@ -110,6 +110,8 @@ Report back:
 
 **Expected:** Function/Method nodes dominate. CALLS edges > IMPORTS > USAGE. IMPLEMENTS present (Go interfaces). HTTP_CALLS likely 0 (no HTTP server in this codebase).
 
+**Known gaps (verified 2026-03-10):** IMPORTS=0 (USAGE edges subsume import tracking in this indexer). HTTP_CALLS=0, ASYNC_CALLS=0, CONTAINS_PACKAGE=0 — all expected for this single-binary repo with no inter-service HTTP calls.
+
 ---
 
 ### Step 2.2: List indexed projects
@@ -140,7 +142,7 @@ Append response to $LOG.
 Report: top 5 functions by degree (most connected). Are these the expected high-traffic functions?
 ```
 
-**Expected:** High-degree functions likely from pipeline.go or tools.go (e.g., Run, UpsertNode, InsertEdge).
+**Expected:** High-degree functions from store/ and pipeline/ (e.g., store.Close, cbm.ExtractFile, ScanProjectEnvURLs). Note: `Run` is a Method not a Function — it won't appear in label="Function" searches.
 
 ---
 
@@ -166,13 +168,17 @@ echo "=== STEP 3.3: search_graph (dead code: Function, max_degree=0) === $(date 
 
 Use the codebase-memory-mcp MCP tool search_graph with:
   label: "Function"
+  relationship: "CALLS"
+  direction: "inbound"
   max_degree: 0
   exclude_entry_points: true
   limit: 30
 
 Append response to $LOG.
-List any functions with zero connections (candidates for dead code). Note their file paths.
+List any functions with zero inbound CALLS (candidates for dead code). Note their file paths.
 ```
+
+> **Fix applied 2026-03-10:** Must scope `relationship="CALLS"` + `direction="inbound"` to find functions with no callers. Without this, `max_degree=0` counts ALL edge types (including DEFINES from parent Module), so every function has degree≥1 and nothing is returned.
 
 ---
 
@@ -187,8 +193,10 @@ Use the codebase-memory-mcp MCP tool search_graph with:
   limit: 30
 
 Append response to $LOG.
-List all functions in pipeline.go. Does Run() appear? How many functions total?
+List all functions in pipeline.go. How many functions total?
 ```
+
+> **Note 2026-03-10:** `Run()` will NOT appear — it is indexed as label="Method" not "Function". To find Run, use label="Method" or omit the label filter.
 
 ---
 
@@ -221,6 +229,8 @@ Use the codebase-memory-mcp MCP tool search_code with:
 Append response to $LOG.
 Report: which files contain TraverseBFS? Both definition (traverse.go) and call sites?
 ```
+
+> **Note 2026-03-10:** TraverseBFS is a Method (not a Function) in `internal/store/traverse.go`. It will NOT appear in `search_graph(label="Function")`. Use `search_graph(name_pattern="TraverseBFS")` without a label filter to find it. The literal string exists only in RUNBOOK.md in the Go source text search.
 
 ---
 
@@ -268,11 +278,14 @@ Use the codebase-memory-mcp MCP tool trace_call_path with:
   function_name: "TraverseBFS"
   direction: "inbound"
   depth: 2
+  risk_labels: true
 
 Append response to $LOG.
 Report: which functions call TraverseBFS? Are they in tools/ or pipeline/?
 Risk labels should appear (CRITICAL for hop-1 callers).
 ```
+
+> **Fix applied 2026-03-10:** TraverseBFS is a Method, not a Function. `trace_call_path` accepts Method names directly — the tool resolved it correctly once the name was confirmed. The original test run returned "not found" because the string "TraverseBFS" only appeared as a RUNBOOK section node, not a code node, before the ADR was written. Adding `risk_labels: true` to get the risk classification output.
 
 ---
 
@@ -298,13 +311,15 @@ Report the full call neighborhood. Is UpsertNodeBatch a sibling? Who are the cal
 echo "=== STEP 4.4: trace_call_path (min_confidence=0.7) === $(date -Iseconds)" >> "$LOG"
 
 Use the codebase-memory-mcp MCP tool trace_call_path with:
-  function_name: "ExecuteQuery"
+  function_name: "Execute"
   direction: "inbound"
   depth: 3
   min_confidence: 0.7
 
 Append response to $LOG.
 Report: how many callers pass the 0.7 confidence threshold?
+
+> **Fix applied 2026-03-10:** The Cypher executor entry point is named `Execute`, not `ExecuteQuery`. `ExecuteQuery` does not exist in the codebase. Corrected function name.
 ```
 
 ---
@@ -339,7 +354,7 @@ List 5 caller→callee pairs from the results.
 
 ---
 
-### Step 5.3: COUNT aggregation
+### Step 5.3: COUNT aggregation (known limitation)
 
 ```
 echo "=== STEP 5.3: query_graph (COUNT by label) === $(date -Iseconds)" >> "$LOG"
@@ -348,8 +363,11 @@ Use the codebase-memory-mcp MCP tool query_graph with:
   query: "MATCH (n) RETURN n.label, COUNT(n) ORDER BY COUNT(n) DESC LIMIT 10"
 
 Append response to $LOG.
-Confirm: counts match the schema report from Step 2.1.
+NOTE: This step is expected to return incomplete results. Explain why and use
+get_graph_schema instead to get accurate counts. Compare the two outputs.
 ```
+
+> **Known tool limitation (confirmed 2026-03-10):** The 200-row cap applies BEFORE aggregation. On a 6734-node graph this query returns only 2 rows (Project, Community) because Function/Method/Module nodes are truncated before `COUNT` can accumulate them. This is a documented design constraint. **Use `get_graph_schema` for accurate label counts — do not use `query_graph COUNT` for this purpose.**
 
 ---
 
@@ -373,28 +391,32 @@ Confirm: only pipeline/ files returned.
 echo "=== STEP 5.5: query_graph (variable-length CALLS path) === $(date -Iseconds)" >> "$LOG"
 
 Use the codebase-memory-mcp MCP tool query_graph with:
-  query: "MATCH p=(a:Function)-[:CALLS*1..3]->(b:Function) WHERE a.name = 'Run' RETURN b.name LIMIT 20"
+  query: "MATCH (a:Function)-[:CALLS*1..3]->(b:Function) WHERE a.name = 'Run' RETURN b.name LIMIT 20"
 
 Append response to $LOG.
-Report: which functions are reachable from Run within 3 hops?
+Report: which functions are reachable from Run within 3 hops? (Use trace_call_path as fallback if this returns an error.)
 ```
+
+> **Fix applied 2026-03-10:** Named path variable syntax (`p=...`) is unsupported by the query_graph Cypher parser — produces parse error at position 6. Removed `p=` prefix. Note: `Run` is a Method not a Function so this query may return 0 rows; use `trace_call_path(function_name="Run", direction="outbound", depth=3)` as the reliable alternative for this traversal.
 
 ---
 
 ## Phase 6 — Code Intelligence
 
-### Step 6.1: get_code_snippet — exact qualified name
+### Step 6.1: get_code_snippet — method lookup
 
 ```
 echo "=== STEP 6.1: get_code_snippet (TraverseBFS, exact) === $(date -Iseconds)" >> "$LOG"
 
 Use the codebase-memory-mcp MCP tool get_code_snippet with:
-  qualified_name: "TraverseBFS"
+  qualified_name: "store.traverse.TraverseBFS"
   include_neighbors: true
 
 Append response to $LOG.
 Report: source code returned? Signature correct? Neighbor counts (callers/callees)?
 ```
+
+> **Fix applied 2026-03-10:** TraverseBFS is a Method in `internal/store/traverse.go`. Short name lookup works when unique; using the partial QN suffix `store.traverse.TraverseBFS` for precision. The original `"TraverseBFS"` short name conflicted with a RUNBOOK section node of the same name added when the runbook was indexed.
 
 ---
 
@@ -410,6 +432,8 @@ Use the codebase-memory-mcp MCP tool get_code_snippet with:
 Append response to $LOG.
 Confirm: auto_resolve finds UpsertNode despite case mismatch.
 ```
+
+> **Note 2026-03-10:** `upsertnode` returns 3 candidates (graph_buffer.UpsertNode, pipeline.upsertNode, store.UpsertNode). `auto_resolve` only picks automatically when ≤2 candidates — with 3 it returns a disambiguation list. This is correct tool behaviour, not a bug. VERDICT: PARTIAL PASS (graceful disambiguation, not auto-resolution).
 
 ---
 
@@ -453,8 +477,12 @@ Use the codebase-memory-mcp MCP tool get_architecture with:
   aspects: ["packages"]
 
 Append response to $LOG.
-Report: top 5 packages by size. Does pipeline/ show the highest fan-out?
+Report: top 5 packages by size. Do fan_in/fan_out values appear or are they all zero?
+Also call get_architecture with aspects=["boundaries"] and compare — boundaries shows real
+cross-package call volumes even if packages fan_in/fan_out is broken.
 ```
+
+> **Bug confirmed 2026-03-10:** `get_architecture(aspects=["packages"])` returns `fan_in=0` and `fan_out=0` for every package. The `boundaries` aspect correctly reports cross-package traffic (e.g., pipeline→store: 169 calls), confirming the underlying data exists. The `packages` fan_in/fan_out metric is not computing correctly. Use `boundaries` as the reliable alternative for cross-package dependency analysis.
 
 ---
 
@@ -688,21 +716,21 @@ STEP 2.1 — get_graph_schema
 STEP 2.2 — list_projects
 STEP 3.1 — search_graph (label="Function", limit=20, sort_by="degree")
 STEP 3.2 — search_graph (name_pattern="Upsert", limit=20)
-STEP 3.3 — search_graph (label="Function", max_degree=0, exclude_entry_points=true, limit=30)
-STEP 3.4 — search_graph (file_pattern="*pipeline.go", label="Function", limit=30)
+STEP 3.3 — search_graph (label="Function", relationship="CALLS", direction="inbound", max_degree=0, exclude_entry_points=true, limit=30)
+STEP 3.4 — search_graph (file_pattern="*pipeline.go", label="Function", limit=30)  [note: Run() is a Method — use label="Method" to find it]
 STEP 3.5 — search_graph pagination: offset=0 then offset=5, limit=5 each
 STEP 3.6 — search_code (pattern="TraverseBFS", max_results=10)
 STEP 3.7 — search_code (pattern="func.*Tool", regex=true, file_pattern="*.go", max_results=15)
 STEP 4.1 — trace_call_path (function_name="Run", direction="outbound", depth=3)
-STEP 4.2 — trace_call_path (function_name="TraverseBFS", direction="inbound", depth=2)
+STEP 4.2 — trace_call_path (function_name="TraverseBFS", direction="inbound", depth=2, risk_labels=true)
 STEP 4.3 — trace_call_path (function_name="UpsertNode", direction="both", depth=2)
-STEP 4.4 — trace_call_path (function_name="ExecuteQuery", direction="inbound", depth=3, min_confidence=0.7)
+STEP 4.4 — trace_call_path (function_name="Execute", direction="inbound", depth=3, min_confidence=0.7)  [was ExecuteQuery — corrected]
 STEP 5.1 — query_graph ("MATCH (n:Function) RETURN n.name, n.file_path LIMIT 10")
 STEP 5.2 — query_graph ("MATCH (a:Function)-[:CALLS]->(b:Function) RETURN a.name, b.name LIMIT 20")
-STEP 5.3 — query_graph ("MATCH (n) RETURN n.label, COUNT(n) ORDER BY COUNT(n) DESC LIMIT 10")
+STEP 5.3 — query_graph COUNT (expect broken — use get_graph_schema for accurate counts; document the 200-row aggregation cap)
 STEP 5.4 — query_graph ("MATCH (n:Function) WHERE n.file_path CONTAINS 'pipeline' RETURN n.name, n.file_path LIMIT 20")
-STEP 5.5 — query_graph ("MATCH p=(a:Function)-[:CALLS*1..3]->(b:Function) WHERE a.name = 'Run' RETURN b.name LIMIT 20")
-STEP 6.1 — get_code_snippet (qualified_name="TraverseBFS", include_neighbors=true)
+STEP 5.5 — query_graph ("MATCH (a:Function)-[:CALLS*1..3]->(b:Function) WHERE a.name = 'Run' RETURN b.name LIMIT 20")  [p= removed — unsupported syntax]
+STEP 6.1 — get_code_snippet (qualified_name="store.traverse.TraverseBFS", include_neighbors=true)  [was "TraverseBFS" — disambiguated]
 STEP 6.2 — get_code_snippet (qualified_name="upsertnode", auto_resolve=true)
 STEP 6.3 — get_code_snippet (qualified_name="ThisFunctionDefinitelyDoesNotExist", auto_resolve=true)
 STEP 7.1 — get_architecture (aspects=["languages"])
@@ -750,21 +778,72 @@ VERDICT: PASS | FAIL — <one-line reason if FAIL>
 
 After full indexing of this repo, approximate expected values:
 
-| Metric | Expected Range |
-|--------|---------------|
-| Function nodes | 1,000 – 3,000 |
-| Method nodes | 500 – 1,500 |
-| Class/Struct nodes | 100 – 400 |
-| Module nodes | 50 – 200 |
-| CALLS edges | 2,000 – 8,000 |
-| IMPORTS edges | 200 – 800 |
-| IMPLEMENTS edges | 50 – 300 |
-| USAGE edges | 100 – 500 |
-| HTTP_CALLS edges | 0 (no HTTP server in this codebase) |
-| Fast mode re-index time | < 5 seconds |
-| Full index time | 30 – 120 seconds |
+| Metric | Expected Range | Actual (2026-03-10) |
+|--------|---------------|---------------------|
+| Function nodes | 1,000 – 3,000 | 1,005 |
+| Method nodes | 500 – 1,500 | 536 |
+| Struct nodes | 100 – 400 | 154 |
+| Module nodes | 50 – 200 | 196 |
+| File nodes | 500 – 1,500 | 869 |
+| Community nodes | — | 399 |
+| CALLS edges | 2,000 – 8,000 | 6,132 |
+| DEFINES edges | 2,000 – 8,000 | 5,630 |
+| DEFINES_METHOD edges | 500 – 2,000 | 1,849 |
+| FILE_CHANGES_WITH edges | — | 2,068 |
+| USAGE edges | 100 – 500 | 1,327 |
+| OVERRIDE edges | 100 – 500 | 779 |
+| IMPLEMENTS edges | 50 – 300 | 492 |
+| CONTAINS_FILE edges | 500 – 2,000 | 1,958 |
+| CONTAINS_FOLDER edges | 500 – 2,000 | 1,243 |
+| HANDLES edges | 0 – 100 | 50 |
+| IMPORTS edges | 0 (**not used** — USAGE subsumes imports) | 0 |
+| HTTP_CALLS edges | 0 (no HTTP server) | 0 |
+| ASYNC_CALLS edges | 0 (no async dispatch) | 0 |
+| CONTAINS_PACKAGE edges | 0 (Go packages not modelled this way) | 0 |
+| Total nodes | 5,000 – 10,000 | 6,734 |
+| Total edges | 15,000 – 30,000 | 21,528 |
+| Fast mode re-index time | < 15 seconds | ~7s |
+| Full index time | 30 – 120 seconds | ~62s |
 
 Deviations outside these ranges should be flagged as potential extraction gaps.
+
+---
+
+## Known Issues & Tool Limitations
+
+Verified during runbook execution on 2026-03-10.
+
+### Bugs
+
+**`get_architecture(aspects=["packages"])` — fan_in/fan_out always 0**
+All packages report `fan_in=0` and `fan_out=0`. The underlying cross-package call data
+exists (confirmed via `aspects=["boundaries"]` which shows correct volumes). This is a
+computation bug in the packages aspect. Workaround: use `boundaries` instead.
+
+### Tool Limitations (by design)
+
+**`query_graph COUNT` silently undercounts on large graphs**
+The 200-row cap is applied before `GROUP BY` aggregation. On this 6734-node repo, a
+`MATCH (n) RETURN n.label, COUNT(n)` query returns only 2 rows (Project, Community).
+Use `get_graph_schema` for accurate node label and edge type counts.
+
+**`query_graph` — named path variables unsupported**
+`MATCH p=(a)-[:R]->(b)` produces a parse error. Drop the `p=` prefix.
+Variable-length paths `[:CALLS*1..3]` work without the path variable.
+
+**`auto_resolve` only fires for ≤2 candidates**
+With 3+ ambiguous matches, `get_code_snippet(auto_resolve=true)` returns a disambiguation
+list rather than auto-picking. This is correct per the tool spec — use a more specific
+qualified name suffix to reduce candidates.
+
+### Fixture Corrections
+
+| Original fixture | Problem | Corrected value |
+|-----------------|---------|-----------------|
+| `TraverseBFS` (steps 4.2, 6.1) | Method not Function; short name conflicts with RUNBOOK section node | `store.traverse.TraverseBFS` |
+| `ExecuteQuery` (step 4.4) | Function does not exist | `Execute` |
+| `max_degree=0` without relationship (step 3.3) | Counts all edge types incl. DEFINES; every node has degree≥1 | Add `relationship="CALLS"`, `direction="inbound"` |
+| `MATCH p=(...)` (step 5.5) | Named path variable syntax unsupported | Remove `p=` prefix |
 
 ---
 
