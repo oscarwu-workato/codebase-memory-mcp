@@ -191,3 +191,130 @@ func TestLouvainSingleNodeGraph(t *testing.T) {
 		t.Error("expected node 42 in partition")
 	}
 }
+
+// --- louvainWithWarmStart tests ---
+
+// twoClusterGraph returns a 4-node graph with two clear clusters:
+// nodes 1,2 form cluster A (connected) and nodes 3,4 form cluster B (connected),
+// with no edges between clusters.
+func twoClusterGraph() ([]int64, []louvainEdge) {
+	nodes := []int64{1, 2, 3, 4}
+	edges := []louvainEdge{
+		{src: 1, dst: 2},
+		{src: 3, dst: 4},
+	}
+	return nodes, edges
+}
+
+// TestLouvainWithWarmStartNil verifies that louvainWithWarmStart(nodes, edges, nil)
+// and louvain(nodes, edges) both produce valid full partitions.
+func TestLouvainWithWarmStartNil(t *testing.T) {
+	nodes, edges := twoClusterGraph()
+
+	p1 := louvainWithWarmStart(nodes, edges, nil)
+	p2 := louvain(nodes, edges)
+
+	for _, p := range []map[int64]int{p1, p2} {
+		if len(p) != len(nodes) {
+			t.Fatalf("expected %d entries, got %d", len(nodes), len(p))
+		}
+		for _, id := range nodes {
+			if _, ok := p[id]; !ok {
+				t.Errorf("node %d missing from partition", id)
+			}
+		}
+	}
+}
+
+// TestLouvainWithWarmStartPerfect runs louvain on a 2-cluster graph to get
+// partition P, then calls louvainWithWarmStart with P. The result must still
+// group each original cluster together.
+func TestLouvainWithWarmStartPerfect(t *testing.T) {
+	nodes := []int64{1, 2, 3, 4, 5, 6}
+	edges := []louvainEdge{
+		{src: 1, dst: 2}, {src: 2, dst: 3}, {src: 1, dst: 3},
+		{src: 4, dst: 5}, {src: 5, dst: 6}, {src: 4, dst: 6},
+	}
+
+	warmStart := louvain(nodes, edges)
+	if len(warmStart) != len(nodes) {
+		t.Fatalf("initial partition: expected %d entries, got %d", len(nodes), len(warmStart))
+	}
+
+	result := louvainWithWarmStart(nodes, edges, warmStart)
+	if len(result) != len(nodes) {
+		t.Fatalf("warm-start partition: expected %d entries, got %d", len(nodes), len(result))
+	}
+
+	// Cluster A (nodes 1,2,3) must be in the same community.
+	commA := result[1]
+	for _, id := range []int64{2, 3} {
+		if result[id] != commA {
+			t.Errorf("cluster A: node %d in community %d, want %d", id, result[id], commA)
+		}
+	}
+
+	// Cluster B (nodes 4,5,6) must be in the same community.
+	commB := result[4]
+	for _, id := range []int64{5, 6} {
+		if result[id] != commB {
+			t.Errorf("cluster B: node %d in community %d, want %d", id, result[id], commB)
+		}
+	}
+
+	// The two clusters must be in different communities.
+	if commA == commB {
+		t.Errorf("expected two distinct communities, both clusters in community %d", commA)
+	}
+}
+
+// TestLouvainWithWarmStartNewNode runs louvain on 4 nodes, then adds a 5th node
+// not present in the warm-start partition. The 5th node must appear in the result.
+func TestLouvainWithWarmStartNewNode(t *testing.T) {
+	nodes4 := []int64{1, 2, 3, 4}
+	edges4 := []louvainEdge{
+		{src: 1, dst: 2},
+		{src: 3, dst: 4},
+	}
+
+	warmStart := louvain(nodes4, edges4)
+
+	// Extend to 5 nodes; node 5 connects to cluster B.
+	nodes5 := []int64{1, 2, 3, 4, 5}
+	edges5 := append(edges4, louvainEdge{src: 4, dst: 5})
+
+	result := louvainWithWarmStart(nodes5, edges5, warmStart)
+	if len(result) != len(nodes5) {
+		t.Fatalf("expected %d entries, got %d", len(nodes5), len(result))
+	}
+	if _, ok := result[5]; !ok {
+		t.Error("node 5 (new node) missing from warm-start result")
+	}
+}
+
+// TestLouvainWithWarmStartCompactIDs verifies that when warmStart has sparse
+// community IDs (100, 200, 300), the algorithm internally compacts them and
+// returns a valid partition without panics.
+func TestLouvainWithWarmStartCompactIDs(t *testing.T) {
+	nodes := []int64{10, 20, 30, 40, 50, 60}
+	edges := []louvainEdge{
+		{src: 10, dst: 20}, {src: 20, dst: 30}, {src: 10, dst: 30},
+		{src: 40, dst: 50}, {src: 50, dst: 60}, {src: 40, dst: 60},
+	}
+
+	// Sparse community IDs — not sequential from 0.
+	warmStart := map[int64]int{
+		10: 100, 20: 100, 30: 100,
+		40: 200, 50: 200, 60: 200,
+	}
+
+	result := louvainWithWarmStart(nodes, edges, warmStart)
+	if len(result) != len(nodes) {
+		t.Fatalf("expected %d entries, got %d", len(nodes), len(result))
+	}
+	for _, id := range nodes {
+		if _, ok := result[id]; !ok {
+			t.Errorf("node %d missing from result", id)
+		}
+	}
+}

@@ -1,5 +1,5 @@
 {
-  "feature": "perf/week1-week2: store indexes + read-only DB, arch cache + double-call fix, Louvain early-exit + parallel post-flush, LIKE hints + resolver memoization",
+  "feature": "perf/week2: fsnotify watcher, Louvain warm-start with community_cache, communityGraphHash topology fingerprint, batched SaveCommunityCache, ctx-aware LoadCommunityCache",
   "status": "in_progress",
   "mode": "suite",
   "coverage_target": 80,
@@ -7,6 +7,6 @@
   "current_phase": 1,
   "completed_steps": [],
   "files_created": [],
-  "started_at": "2026-03-12T04:30:00Z",
-  "last_updated": "2026-03-12T04:30:00Z"
+  "started_at": "2026-03-12T05:30:00Z",
+  "last_updated": "2026-03-12T05:30:00Z"
 }
