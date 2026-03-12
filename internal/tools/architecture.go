@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/DeusData/codebase-memory-mcp/internal/store"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -40,6 +41,18 @@ func (s *Server) handleGetArchitecture(_ context.Context, req *mcp.CallToolReque
 		projName = projects[0].Name
 	}
 
+	cacheKey := projName + ":" + strings.Join(aspects, ",")
+
+	// Cache read: return stored JSON string directly on hit.
+	s.archCacheMu.RLock()
+	if cached, ok := s.archCache[cacheKey]; ok {
+		s.archCacheMu.RUnlock()
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: cached}},
+		}, nil
+	}
+	s.archCacheMu.RUnlock()
+
 	info, err := st.GetArchitecture(projName, aspects)
 	if err != nil {
 		return errResult(fmt.Sprintf("architecture: %v", err)), nil
@@ -51,6 +64,16 @@ func (s *Server) handleGetArchitecture(_ context.Context, req *mcp.CallToolReque
 	s.addIndexStatus(responseData)
 	result := jsonResult(responseData)
 	s.addUpdateNotice(result)
+
+	// Cache write: store JSON string for future hits.
+	if len(result.Content) > 0 && !result.IsError {
+		if tc, ok := result.Content[0].(*mcp.TextContent); ok {
+			s.archCacheMu.Lock()
+			s.archCache[cacheKey] = tc.Text
+			s.archCacheMu.Unlock()
+		}
+	}
+
 	return result, nil
 }
 

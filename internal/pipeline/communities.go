@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"math"
@@ -8,6 +9,20 @@ import (
 
 	"github.com/DeusData/codebase-memory-mcp/internal/store"
 )
+
+// communityGraphHash returns a fingerprint of the community graph state.
+// Includes node count, edge count, and a checksum of node/edge IDs to detect
+// topology changes that preserve counts (e.g., one function deleted, another added).
+func communityGraphHash(allNodes map[int64]bool, callEdges []*store.Edge) string {
+	var nodeSum, edgeXOR uint64
+	for id := range allNodes {
+		nodeSum += uint64(id)
+	}
+	for _, e := range callEdges {
+		edgeXOR ^= uint64(e.SourceID) ^ uint64(e.TargetID)
+	}
+	return fmt.Sprintf("%d:%d:%x:%x", len(allNodes), len(callEdges), nodeSum, edgeXOR)
+}
 
 // passCommunities runs Louvain community detection on the CALLS graph
 // and creates Community nodes + MEMBER_OF edges.
@@ -37,26 +52,67 @@ func (p *Pipeline) passCommunities() {
 		adj[e.TargetID][e.SourceID] = true
 	}
 
+	// Load warm-start partition from cache if graph fingerprint matches.
+	ctx := context.Background()
+	graphHash := communityGraphHash(allNodes, callEdges)
+	warmStart, err := p.Store.LoadCommunityCache(ctx, p.ProjectName, graphHash)
+	if err != nil {
+		slog.Warn("pass.communities.cache.load.err", "err", err)
+		warmStart = nil
+	}
+	slog.Info("pass.communities.cache", "hit", warmStart != nil, "hash", graphHash)
+
 	// Run Louvain community detection
-	communities := louvainCommunities(adj, allNodes)
+	communities, nodeCommunity := louvainCommunities(adj, allNodes, warmStart)
+
+	// Persist the partition for warm-starting future runs.
+	if saveErr := p.Store.SaveCommunityCache(ctx, p.ProjectName, graphHash, nodeCommunity); saveErr != nil {
+		slog.Warn("pass.communities.cache.save.err", "err", saveErr)
+	}
 
 	// Create Community nodes + MEMBER_OF edges
 	communityCount, memberOfCount := p.storeCommunities(communities)
 	slog.Info("pass.communities.done", "communities", communityCount, "member_of", memberOfCount)
 }
 
-// louvainCommunities implements the Louvain algorithm for community detection.
-// Uses per-community degree accumulators for O(m) per iteration instead of O(N^2).
-// Returns a map of community_id → []node_id.
-func louvainCommunities(adj map[int64]map[int64]bool, allNodes map[int64]bool) map[int][]int64 {
+// initNodeCommunities assigns initial community IDs to nodes, optionally
+// seeded from a warm-start partition. New nodes not in warmStart get fresh IDs.
+func initNodeCommunities(allNodes map[int64]bool, warmStart map[int64]int) map[int64]int {
 	nodeCommunity := make(map[int64]int, len(allNodes))
-	commID := 0
-	for nodeID := range allNodes {
-		nodeCommunity[nodeID] = commID
-		commID++
+	if warmStart == nil {
+		commID := 0
+		for nodeID := range allNodes {
+			nodeCommunity[nodeID] = commID
+			commID++
+		}
+		return nodeCommunity
 	}
 
-	// Pre-compute node degrees
+	nextComm := 0
+	for _, c := range warmStart {
+		if c >= nextComm {
+			nextComm = c + 1
+		}
+	}
+	for nodeID := range allNodes {
+		if c, ok := warmStart[nodeID]; ok {
+			nodeCommunity[nodeID] = c
+		} else {
+			nodeCommunity[nodeID] = nextComm
+			nextComm++
+		}
+	}
+	return nodeCommunity
+}
+
+// louvainCommunities implements the Louvain algorithm for community detection.
+// Uses per-community degree accumulators for O(m) per iteration instead of O(N^2).
+// warmStart, when non-nil, seeds node assignments from a prior run, reducing
+// iterations from up to 50 down to 1-3 for small incremental changes.
+// Returns the grouped community map and the flat nodeCommunity map for caching.
+func louvainCommunities(adj map[int64]map[int64]bool, allNodes map[int64]bool, warmStart map[int64]int) (map[int][]int64, map[int64]int) {
+	nodeCommunity := initNodeCommunities(allNodes, warmStart)
+
 	nodeDegree := make(map[int64]float64, len(allNodes))
 	totalEdges := 0
 	for nodeID, neighbors := range adj {
@@ -68,11 +124,9 @@ func louvainCommunities(adj map[int64]map[int64]bool, allNodes map[int64]bool) m
 		m = 1
 	}
 
-	// Per-community accumulator: sum of degrees of all members.
-	// Updated incrementally when nodes move between communities.
 	commSumTot := make(map[int]float64, len(allNodes))
 	for nodeID, comm := range nodeCommunity {
-		commSumTot[comm] = nodeDegree[nodeID]
+		commSumTot[comm] += nodeDegree[nodeID]
 	}
 
 	improved := true
@@ -80,7 +134,7 @@ func louvainCommunities(adj map[int64]map[int64]bool, allNodes map[int64]bool) m
 		improved = louvainIteration(adj, nodeCommunity, nodeDegree, commSumTot, m)
 	}
 
-	return groupAndFilter(nodeCommunity)
+	return groupAndFilter(nodeCommunity), nodeCommunity
 }
 
 // louvainIteration runs one pass of greedy modularity optimization.
@@ -156,83 +210,58 @@ func groupAndFilter(nodeCommunity map[int64]int) map[int][]int64 {
 	return filtered
 }
 
-// storeCommunities creates Community nodes and MEMBER_OF edges in the database.
-func (p *Pipeline) storeCommunities(communities map[int][]int64) (communityCount, memberOfCount int) {
-	if len(communities) == 0 {
-		return 0, 0
+// buildCommunityNode creates a Community node with metadata for a single community.
+func buildCommunityNode(project string, commIdx int, memberIDs []int64, nodeMap map[int64]*store.Node) *store.Node {
+	topNames := topMemberNames(memberIDs, nodeMap, 5)
+
+	commName := fmt.Sprintf("community_%d", commIdx)
+	if len(topNames) > 0 {
+		commName = topNames[0] + "_cluster"
 	}
 
-	// Collect all member node IDs for batch lookup
-	var allMemberIDs []int64
-	for _, members := range communities {
-		allMemberIDs = append(allMemberIDs, members...)
+	cohesion := communityCohesion(memberIDs, nodeMap)
+
+	return &store.Node{
+		Project:       project,
+		Label:         "Community",
+		Name:          commName,
+		QualifiedName: fmt.Sprintf("%s.__community__.%d", project, commIdx),
+		Properties: map[string]any{
+			"cohesion":     math.Round(cohesion*100) / 100,
+			"symbol_count": len(memberIDs),
+			"top_symbols":  topNames,
+		},
 	}
-	nodeMap, _ := p.Store.FindNodesByIDs(allMemberIDs)
+}
 
-	communityNodes := make([]*store.Node, 0, len(communities))
-	memberEdges := make([]pendingEdge, 0, len(allMemberIDs))
-
-	for commIdx, memberIDs := range communities {
-		// Find top symbols by name for labeling
-		topNames := topMemberNames(memberIDs, nodeMap, 5)
-
-		commName := fmt.Sprintf("community_%d", commIdx)
-		if len(topNames) > 0 {
-			commName = topNames[0] + "_cluster"
+// collectMemberEdges builds pending MEMBER_OF edges and tags member nodes
+// with the community index.
+func collectMemberEdges(commIdx int, commQN string, memberIDs []int64, nodeMap map[int64]*store.Node) []pendingEdge {
+	var edges []pendingEdge
+	for _, memberID := range memberIDs {
+		memberNode := nodeMap[memberID]
+		if memberNode == nil {
+			continue
 		}
-
-		commQN := fmt.Sprintf("%s.__community__.%d", p.ProjectName, commIdx)
-
-		// Calculate cohesion: ratio of internal edges to possible edges
-		cohesion := communityCohesion(memberIDs, nodeMap)
-
-		communityNodes = append(communityNodes, &store.Node{
-			Project:       p.ProjectName,
-			Label:         "Community",
-			Name:          commName,
-			QualifiedName: commQN,
-			Properties: map[string]any{
-				"cohesion":     math.Round(cohesion*100) / 100,
-				"symbol_count": len(memberIDs),
-				"top_symbols":  topNames,
-			},
+		edges = append(edges, pendingEdge{
+			SourceQN: memberNode.QualifiedName,
+			TargetQN: commQN,
+			Type:     "MEMBER_OF",
 		})
-
-		for _, memberID := range memberIDs {
-			memberNode := nodeMap[memberID]
-			if memberNode == nil {
-				continue
-			}
-			memberEdges = append(memberEdges, pendingEdge{
-				SourceQN: memberNode.QualifiedName,
-				TargetQN: commQN,
-				Type:     "MEMBER_OF",
-			})
-
-			// Also store community_id on the member node (via properties update)
-			if memberNode.Properties == nil {
-				memberNode.Properties = make(map[string]any)
-			}
-			memberNode.Properties["community_id"] = commIdx
+		if memberNode.Properties == nil {
+			memberNode.Properties = make(map[string]any)
 		}
+		memberNode.Properties["community_id"] = commIdx
 	}
+	return edges
+}
 
-	// Batch insert community nodes
-	idMap, err := p.Store.UpsertNodeBatch(communityNodes)
-	if err != nil {
-		slog.Warn("pass.communities.upsert.err", "err", err)
-		return 0, 0
-	}
-
-	// Resolve and insert MEMBER_OF edges
+// resolveMemberOfEdges resolves pending MEMBER_OF edges to concrete store edges.
+func (p *Pipeline) resolveMemberOfEdges(pending []pendingEdge, idMap map[string]int64) []*store.Edge {
 	var edges []*store.Edge
-	for _, pe := range memberEdges {
-		srcQN := pe.SourceQN
-		tgtQN := pe.TargetQN
-
-		srcNode, _ := p.Store.FindNodeByQN(p.ProjectName, srcQN)
-		tgtID, tgtOK := idMap[tgtQN]
-
+	for _, pe := range pending {
+		srcNode, _ := p.Store.FindNodeByQN(p.ProjectName, pe.SourceQN)
+		tgtID, tgtOK := idMap[pe.TargetQN]
 		if srcNode != nil && tgtOK {
 			edges = append(edges, &store.Edge{
 				Project:  p.ProjectName,
@@ -242,7 +271,37 @@ func (p *Pipeline) storeCommunities(communities map[int][]int64) (communityCount
 			})
 		}
 	}
+	return edges
+}
 
+// storeCommunities creates Community nodes and MEMBER_OF edges in the database.
+func (p *Pipeline) storeCommunities(communities map[int][]int64) (communityCount, memberOfCount int) {
+	if len(communities) == 0 {
+		return 0, 0
+	}
+
+	var allMemberIDs []int64
+	for _, members := range communities {
+		allMemberIDs = append(allMemberIDs, members...)
+	}
+	nodeMap, _ := p.Store.FindNodesByIDs(allMemberIDs)
+
+	communityNodes := make([]*store.Node, 0, len(communities))
+	var memberEdges []pendingEdge
+
+	for commIdx, memberIDs := range communities {
+		commNode := buildCommunityNode(p.ProjectName, commIdx, memberIDs, nodeMap)
+		communityNodes = append(communityNodes, commNode)
+		memberEdges = append(memberEdges, collectMemberEdges(commIdx, commNode.QualifiedName, memberIDs, nodeMap)...)
+	}
+
+	idMap, err := p.Store.UpsertNodeBatch(communityNodes)
+	if err != nil {
+		slog.Warn("pass.communities.upsert.err", "err", err)
+		return 0, 0
+	}
+
+	edges := p.resolveMemberOfEdges(memberEdges, idMap)
 	if len(edges) > 0 {
 		if err := p.Store.InsertEdgeBatch(edges); err != nil {
 			slog.Warn("pass.communities.edges.err", "err", err)

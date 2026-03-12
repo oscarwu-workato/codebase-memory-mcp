@@ -5,9 +5,23 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 )
+
+// validProjectName matches safe project names: must start with alphanumeric,
+// then may contain alphanumeric, hyphen, underscore, or dot.
+// Prevents path traversal (../../..) and dot-only names like "..".
+var validProjectName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// validateProjectName returns an error if name would escape the cache directory.
+func validateProjectName(name string) error {
+	if name == "" || !validProjectName.MatchString(name) {
+		return fmt.Errorf("invalid project name %q: must match [A-Za-z0-9._-]+", name)
+	}
+	return nil
+}
 
 // ProjectInfo holds metadata about a discovered project database.
 type ProjectInfo struct {
@@ -59,8 +73,8 @@ func NewRouterWithDir(dir string) (*StoreRouter, error) {
 
 // ForProject returns the Store for the given project, opening it lazily.
 func (r *StoreRouter) ForProject(name string) (*Store, error) {
-	if name == "*" || name == "all" {
-		return nil, fmt.Errorf("invalid project name: %q", name)
+	if err := validateProjectName(name); err != nil {
+		return nil, err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -75,6 +89,16 @@ func (r *StoreRouter) ForProject(name string) (*Store, error) {
 	}
 	r.stores[name] = s
 	return s, nil
+}
+
+// ForProjectReadOnly returns a read-only store for the named project.
+// Returns an error if the project has not been indexed yet.
+func (r *StoreRouter) ForProjectReadOnly(name string) (*Store, error) {
+	if err := validateProjectName(name); err != nil {
+		return nil, err
+	}
+	dbPath := filepath.Join(r.dir, name+".db")
+	return OpenReadOnly(dbPath)
 }
 
 // AllStores opens all .db files in the cache dir and returns a name→Store map.
@@ -152,6 +176,9 @@ func (r *StoreRouter) ListProjects() ([]*ProjectInfo, error) {
 
 // DeleteProject closes the Store connection and removes the .db + WAL/SHM files.
 func (r *StoreRouter) DeleteProject(name string) error {
+	if err := validateProjectName(name); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 

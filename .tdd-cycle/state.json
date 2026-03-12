@@ -1,0 +1,12 @@
+{
+  "feature": "perf/week2: fsnotify watcher, Louvain warm-start with community_cache, communityGraphHash topology fingerprint, batched SaveCommunityCache, ctx-aware LoadCommunityCache",
+  "status": "in_progress",
+  "mode": "suite",
+  "coverage_target": 80,
+  "current_step": 1,
+  "current_phase": 1,
+  "completed_steps": [],
+  "files_created": [],
+  "started_at": "2026-03-12T05:30:00Z",
+  "last_updated": "2026-03-12T05:30:00Z"
+}

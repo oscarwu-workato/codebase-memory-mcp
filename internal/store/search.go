@@ -173,8 +173,22 @@ func computeSQLLimit(params *SearchParams, nameHasLikeHints, qnHasLikeHints bool
 	hasDegreeFilter := params.MinDegree >= 0 || params.MaxDegree >= 0
 	needsNameScan := (params.NamePattern != "" && !nameHasLikeHints) || (params.QNPattern != "" && !qnHasLikeHints)
 
+	// Degree filtering requires scanning the full result set to count edges accurately.
 	if needsNameScan || hasDegreeFilter {
 		return 200000 // must cover full dataset for accurate Go-side filtering
+	}
+
+	// When a name pattern has extractable LIKE hints the SQL layer pre-filters rows,
+	// so a large full-table scan is unnecessary. Cap at 50K (still well above typical
+	// page sizes) to reduce row transfer. Full 200K is kept for unanchored/complex
+	// patterns that fall through to Go-side regex scanning. Only applies when no
+	// degree filter is active (handled above).
+	if nameHasLikeHints {
+		limit := params.Offset + params.Limit + 5000
+		if limit > 50000 {
+			limit = 50000
+		}
+		return limit
 	}
 	// Scan beyond offset+limit so total/has_more are accurate.
 	// The +1000 buffer ensures has_more is correct for result sets
@@ -421,13 +435,35 @@ func (s *Store) buildFilteredResults(nodes []*Node, params *SearchParams) ([]*Se
 	return results, nil
 }
 
+// hasRegexMetachar reports whether s contains any regex metacharacter.
+func hasRegexMetachar(s string) bool {
+	return strings.ContainsAny(s, `[]()*+?|^${}.\`)
+}
+
 // extractLikeHints extracts literal substrings from a regex pattern for SQL LIKE pre-filtering.
 // Returns substrings that MUST appear in matching text (concatenated via .* or similar).
 // Conservative: returns nil for patterns with alternation (|) since AND LIKE is incorrect for OR semantics.
+//
+// Handles the following special cases up front before the general character walk:
+//   - .*X.*  → returns [X] directly when X has no metacharacters (substring hint)
+//   - X      → returns [X] directly when X has no metacharacters (plain literal hint)
 func extractLikeHints(pattern string) []string {
 	// Bail out on alternation — can't safely convert OR regex to AND LIKE
 	if strings.Contains(pattern, "|") {
 		return nil
+	}
+
+	// Fast path: .*X.* — strip leading and trailing .* and check remainder is literal.
+	stripped := pattern
+	stripped = strings.TrimPrefix(stripped, ".*")
+	stripped = strings.TrimSuffix(stripped, ".*")
+	if stripped != pattern && len(stripped) >= 3 && !hasRegexMetachar(stripped) {
+		return []string{stripped}
+	}
+
+	// Fast path: plain literal (no metacharacters at all) — emit as substring hint.
+	if len(pattern) >= 3 && !hasRegexMetachar(pattern) {
+		return []string{pattern}
 	}
 
 	var hints []string

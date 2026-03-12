@@ -220,7 +220,7 @@ func TestArchLayers(t *testing.T) {
 	s := setupArchTestStore(t)
 	defer s.Close()
 
-	layers, err := s.archLayers("test")
+	layers, err := s.archLayers("test", nil) // nil = no pre-computed boundaries; archLayers fetches its own
 	if err != nil {
 		t.Fatal(err)
 	}

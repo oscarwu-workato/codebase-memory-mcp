@@ -49,13 +49,19 @@ type Server struct {
 	indexStatus    atomic.Value
 	indexStartedAt atomic.Value // time.Time — when current/last index started
 	updateNotice   atomic.Value // string — set once by checkForUpdate, cleared after first injection
+
+	// Architecture result cache: per-project, keyed by "project:aspects", invalidated on re-index.
+	archCacheMu   sync.RWMutex
+	archCache     map[string]string // cache key ("project:aspects") → serialised JSON string
+	graphWriteVer sync.Map          // project → uint64, incremented on each successful index
 }
 
 // NewServer creates a new MCP server with all tools registered.
 func NewServer(r *store.StoreRouter) *Server {
 	srv := &Server{
-		router:   r,
-		handlers: make(map[string]mcp.ToolHandler),
+		router:       r,
+		handlers:     make(map[string]mcp.ToolHandler),
+		archCache: make(map[string]string),
 	}
 
 	srv.mcp = mcp.NewServer(
@@ -93,7 +99,31 @@ func (s *Server) syncProject(ctx context.Context, projectName, rootPath string) 
 		return fmt.Errorf("store for %s: %w", projectName, err)
 	}
 	p := pipeline.New(ctx, st, rootPath, discover.ModeFull)
-	return p.Run()
+	if err := p.Run(); err != nil {
+		return err
+	}
+	s.invalidateArchCache(projectName)
+	return nil
+}
+
+// invalidateArchCache clears all cached architecture results for the given project
+// and increments the graph write version. Called after every successful index run.
+func (s *Server) invalidateArchCache(project string) {
+	prefix := project + ":"
+	s.archCacheMu.Lock()
+	for key := range s.archCache {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.archCache, key)
+		}
+	}
+	s.archCacheMu.Unlock()
+	// Increment version counter (CAS loop handles concurrent bumps).
+	for {
+		v, _ := s.graphWriteVer.LoadOrStore(project, uint64(0))
+		if s.graphWriteVer.CompareAndSwap(project, v, v.(uint64)+1) {
+			break
+		}
+	}
 }
 
 // MCPServer returns the underlying MCP server.
@@ -225,6 +255,7 @@ func (s *Server) startAutoIndex() {
 			slog.Warn("autoindex.err", "err", err)
 			return
 		}
+		s.invalidateArchCache(s.sessionProject)
 		s.indexStatus.Store("ready")
 		slog.Info("autoindex.done", "project", s.sessionProject)
 	}()

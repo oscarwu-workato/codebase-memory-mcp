@@ -85,6 +85,20 @@ func runCLI(args []string) int {
 
 	toolName := positional[0]
 
+	// Tools that never write — open the DB read-only for lower overhead.
+	// TODO: use ForProjectReadOnly for query-only tools
+	_ = map[string]bool{
+		"search_graph":     true,
+		"search_code":      true,
+		"trace_call_path":  true,
+		"query_graph":      true,
+		"get_code_snippet": true,
+		"get_graph_schema": true,
+		"get_architecture": true,
+		"list_projects":    true,
+		"index_status":     true,
+	}
+
 	srv := tools.NewServer(router)
 
 	// In CLI mode, try to set session root from cwd

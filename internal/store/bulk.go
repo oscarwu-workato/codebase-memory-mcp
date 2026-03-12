@@ -11,12 +11,17 @@ var userIndexes = []string{
 	"idx_nodes_label",
 	"idx_nodes_name",
 	"idx_nodes_file",
+	"idx_nodes_file_line",
+	"idx_nodes_entry_point",
+	"idx_nodes_is_test",
 	"idx_edges_source",
 	"idx_edges_target",
 	"idx_edges_type",
 	"idx_edges_target_type",
 	"idx_edges_source_type",
 	"idx_edges_url_path",
+	"idx_community_cache_project",
+	"idx_community_cache_lookup",
 }
 
 // DropUserIndexes drops all user-created indexes for faster bulk writes.
@@ -35,12 +40,25 @@ func (s *Store) CreateUserIndexes(ctx context.Context) error {
 		"CREATE INDEX IF NOT EXISTS idx_nodes_label ON nodes(project, label)",
 		"CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(project, name)",
 		"CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(project, file_path)",
+		`CREATE INDEX IF NOT EXISTS idx_nodes_file_line
+		    ON nodes(project, file_path, start_line, end_line)
+		    WHERE label IN ('Function','Method','Class','Type','Interface','Enum')`,
+		`CREATE INDEX IF NOT EXISTS idx_nodes_entry_point
+		    ON nodes(project)
+		    WHERE json_extract(properties, '$.is_entry_point') = 1`,
+		`CREATE INDEX IF NOT EXISTS idx_nodes_is_test
+		    ON nodes(project)
+		    WHERE json_extract(properties, '$.is_test') = 1`,
 		"CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id, type)",
 		"CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id, type)",
 		"CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(project, type)",
 		"CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(project, target_id, type)",
 		"CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(project, source_id, type)",
 		"CREATE INDEX IF NOT EXISTS idx_edges_url_path ON edges(project, url_path_gen)",
+		"CREATE INDEX IF NOT EXISTS idx_community_cache_project ON community_cache(project)",
+		// Composite index makes LoadCommunityCache(project, hash) a single B-tree seek
+		// instead of a full per-project scan on cache misses.
+		"CREATE INDEX IF NOT EXISTS idx_community_cache_lookup ON community_cache(project, graph_hash)",
 	}
 	for _, ddl := range indexes {
 		if _, err := s.q.Exec(ddl); err != nil {

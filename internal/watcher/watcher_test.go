@@ -89,28 +89,6 @@ func TestSnapshotsEqual(t *testing.T) {
 	}
 }
 
-func TestPollInterval(t *testing.T) {
-	tests := []struct {
-		files    int
-		expected time.Duration
-	}{
-		{0, 1 * time.Second},
-		{70, 1 * time.Second},
-		{499, 1 * time.Second},
-		{500, 2 * time.Second},
-		{2000, 5 * time.Second},
-		{5000, 11 * time.Second},
-		{10000, 21 * time.Second},
-		{50000, 60 * time.Second},
-		{100000, 60 * time.Second},
-	}
-	for _, tt := range tests {
-		got := pollInterval(tt.files)
-		if got != tt.expected {
-			t.Errorf("pollInterval(%d) = %v, want %v", tt.files, got, tt.expected)
-		}
-	}
-}
 
 func TestCaptureSnapshot(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -186,9 +164,10 @@ func TestWatcherTriggersOnChange(t *testing.T) {
 	}
 
 	w := New(r, indexFn)
+	ctx := context.Background()
 
 	// First poll — baseline capture, no index
-	w.pollAll()
+	w.pollAll(ctx)
 	if indexCount.Load() != 0 {
 		t.Errorf("first poll should not trigger index, got %d", indexCount.Load())
 	}
@@ -198,7 +177,7 @@ func TestWatcherTriggersOnChange(t *testing.T) {
 	for _, state := range w.projects {
 		state.nextPoll = time.Time{}
 	}
-	w.pollAll()
+	w.pollAll(ctx)
 	if indexCount.Load() != 0 {
 		t.Errorf("no-change poll should not trigger index, got %d", indexCount.Load())
 	}
@@ -213,7 +192,7 @@ func TestWatcherTriggersOnChange(t *testing.T) {
 	for _, state := range w.projects {
 		state.nextPoll = time.Time{}
 	}
-	w.pollAll()
+	w.pollAll(ctx)
 	if indexCount.Load() != 1 {
 		t.Errorf("changed file should trigger index, got %d", indexCount.Load())
 	}
@@ -257,9 +236,171 @@ func TestWatcherSkipsMissingRoot(t *testing.T) {
 		return nil
 	})
 
-	w.pollAll()
+	w.pollAll(context.Background())
 	if indexCount.Load() != 0 {
 		t.Errorf("should not index missing root, got %d", indexCount.Load())
+	}
+}
+
+// ── Week 2: project-cache and debounce tests ──────────────────────────────
+
+func TestWatcherProjectCache(t *testing.T) {
+	tmpDir := t.TempDir()
+	projName := filepath.Base(tmpDir)
+	r := newTestRouter(t, projName, tmpDir)
+
+	w := New(r, func(_ context.Context, _, _ string) error { return nil })
+
+	w.refreshProjectCache()
+
+	w.cachedProjectsMu.RLock()
+	cached := w.cachedProjects
+	w.cachedProjectsMu.RUnlock()
+	if len(cached) == 0 {
+		t.Fatal("expected cachedProjects to be non-nil after refreshProjectCache")
+	}
+
+	proj, ok := w.projectForPath(tmpDir + "/somefile.go")
+	if !ok {
+		t.Fatal("projectForPath should return true for file under registered root")
+	}
+	if proj == nil {
+		t.Fatal("projectForPath returned nil project")
+	}
+	if proj.Name != projName {
+		t.Errorf("got project name %q, want %q", proj.Name, projName)
+	}
+}
+
+func TestWatcherProjectCacheMiss(t *testing.T) {
+	tmpDir := t.TempDir()
+	r := newTestRouter(t, filepath.Base(tmpDir), tmpDir)
+
+	w := New(r, func(_ context.Context, _, _ string) error { return nil })
+	// intentionally do NOT call refreshProjectCache
+
+	proj, ok := w.projectForPath("/some/unrelated/path")
+	if ok {
+		t.Errorf("expected false for unrelated path, got project %v", proj)
+	}
+	if proj != nil {
+		t.Errorf("expected nil project, got %v", proj)
+	}
+}
+
+func TestWatcherProjectForPathPrefix(t *testing.T) {
+	tmpDir := t.TempDir()
+	projName := "myrepo"
+	r := newTestRouter(t, projName, tmpDir)
+
+	w := New(r, func(_ context.Context, _, _ string) error { return nil })
+	w.refreshProjectCache()
+
+	proj, ok := w.projectForPath(tmpDir + "/subdir/file.go")
+	if !ok {
+		t.Fatal("expected projectForPath to match subdirectory file")
+	}
+	if proj.Name != projName {
+		t.Errorf("got project name %q, want %q", proj.Name, projName)
+	}
+}
+
+func TestWatcherProjectForPathNoFalsePositive(t *testing.T) {
+	tmpDir := t.TempDir()
+	projName := "repo"
+	r := newTestRouter(t, projName, tmpDir)
+
+	w := New(r, func(_ context.Context, _, _ string) error { return nil })
+	w.refreshProjectCache()
+
+	// Construct a path that starts with the same bytes but is a different directory.
+	// tmpDir is something like /tmp/TestXxx123; append "Other" to simulate /tmp/TestXxx123Other.
+	otherPath := tmpDir + "Other/file.go"
+
+	proj, ok := w.projectForPath(otherPath)
+	if ok {
+		t.Errorf("projectForPath should not match sibling directory %q, got project %v", otherPath, proj)
+	}
+}
+
+// newDebouncedTestWatcher creates a Watcher backed by a fresh router rooted at
+// tmpDir and returns the watcher, a counter incremented by indexFn, and a
+// ProjectInfo for the registered project. Extracted because all three
+// triggerDebounced tests share this exact setup.
+func newDebouncedTestWatcher(t *testing.T) (*Watcher, *atomic.Int32, *store.ProjectInfo) {
+	t.Helper()
+	tmpDir := t.TempDir()
+	projName := filepath.Base(tmpDir)
+	r := newTestRouter(t, projName, tmpDir)
+
+	var counter atomic.Int32
+	w := New(r, func(_ context.Context, _, _ string) error {
+		counter.Add(1)
+		return nil
+	})
+	proj := &store.ProjectInfo{Name: projName, RootPath: tmpDir}
+	return w, &counter, proj
+}
+
+func TestWatcherTriggerDebouncedFires(t *testing.T) {
+	w, counter, proj := newDebouncedTestWatcher(t)
+
+	w.triggerDebounced(context.Background(), proj)
+
+	// Wait longer than the debounce window.
+	time.Sleep(200 * time.Millisecond)
+
+	if n := counter.Load(); n != 1 {
+		t.Errorf("expected indexFn called exactly once, got %d", n)
+	}
+}
+
+func TestWatcherTriggerDebouncedCoalesces(t *testing.T) {
+	w, counter, proj := newDebouncedTestWatcher(t)
+
+	// Call 5 times rapidly — all within the debounce window.
+	for i := 0; i < 5; i++ {
+		w.triggerDebounced(context.Background(), proj)
+	}
+
+	// Wait for the single coalesced fire.
+	time.Sleep(200 * time.Millisecond)
+
+	if n := counter.Load(); n != 1 {
+		t.Errorf("expected exactly 1 coalesced fire, got %d", n)
+	}
+}
+
+func TestWatcherTriggerDebouncedCtxCancel(t *testing.T) {
+	w, counter, proj := newDebouncedTestWatcher(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	w.triggerDebounced(ctx, proj)
+	// Cancel before the debounce window elapses.
+	cancel()
+
+	time.Sleep(200 * time.Millisecond)
+
+	if n := counter.Load(); n != 0 {
+		t.Errorf("expected indexFn NOT called after ctx cancel, got %d", n)
+	}
+}
+
+func TestWatcherWatchAllProjectsPrimesState(t *testing.T) {
+	tmpDir := t.TempDir()
+	projName := filepath.Base(tmpDir)
+	r := newTestRouter(t, projName, tmpDir)
+
+	w := New(r, func(_ context.Context, _, _ string) error { return nil })
+
+	w.watchAllProjects()
+
+	w.pollMu.Lock()
+	state := w.projects[projName]
+	w.pollMu.Unlock()
+
+	if state == nil {
+		t.Errorf("expected w.projects[%q] to be non-nil after watchAllProjects", projName)
 	}
 }
 
@@ -279,8 +420,10 @@ func TestWatcherNewFileTriggersIndex(t *testing.T) {
 		return nil
 	})
 
+	ctx := context.Background()
+
 	// Baseline
-	w.pollAll()
+	w.pollAll(ctx)
 
 	// Add a new file
 	if err := os.WriteFile(filepath.Join(tmpDir, "util.go"), []byte("package main\n"), 0o600); err != nil {
@@ -290,7 +433,7 @@ func TestWatcherNewFileTriggersIndex(t *testing.T) {
 	for _, state := range w.projects {
 		state.nextPoll = time.Time{}
 	}
-	w.pollAll()
+	w.pollAll(ctx)
 	if indexCount.Load() != 1 {
 		t.Errorf("new file should trigger index, got %d", indexCount.Load())
 	}

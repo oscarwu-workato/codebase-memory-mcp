@@ -109,6 +109,40 @@ func OpenPath(dbPath string) (*Store, error) {
 	return s, nil
 }
 
+// OpenReadOnly opens an existing database in read-only mode.
+// It skips schema initialisation (tables already exist) and uses
+// settings optimal for queries: no WAL, no fsync, query_only enforcement.
+// Returns an error if the database file does not exist or is not readable.
+func OpenReadOnly(dbPath string) (*Store, error) {
+	// "file:" prefix activates SQLite URI parsing so that mode=ro is enforced:
+	// SQLite will return SQLITE_CANTOPEN instead of creating the file.
+	dsn := "file:" + dbPath +
+		"?mode=ro" +
+		"&_cache_size=-65536" +
+		"&_synchronous=OFF" +
+		"&_mmap_size=1073741824"
+	db, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open read-only %s: %w", dbPath, err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	// Ping forces the driver to open the actual file, catching missing/unreadable
+	// databases immediately rather than at the first query (sql.Open is lazy).
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open read-only %s: %w", dbPath, err)
+	}
+	if _, err := db.Exec("PRAGMA query_only = ON"); err != nil {
+		// Non-fatal: older SQLite versions may not support query_only
+		_ = err
+	}
+	if _, err := db.Exec("PRAGMA temp_store = MEMORY"); err != nil {
+		return nil, fmt.Errorf("pragma temp_store: %w", err)
+	}
+	return &Store{db: db, q: db, dbPath: dbPath}, nil
+}
+
 // OpenMemory opens an in-memory SQLite database (for testing).
 func OpenMemory() (*Store, error) {
 	dsn := ":memory:?_foreign_keys=1" +
@@ -215,6 +249,18 @@ func (s *Store) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(project, name);
 	CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(project, file_path);
 
+	CREATE INDEX IF NOT EXISTS idx_nodes_file_line
+	    ON nodes(project, file_path, start_line, end_line)
+	    WHERE label IN ('Function','Method','Class','Type','Interface','Enum');
+
+	CREATE INDEX IF NOT EXISTS idx_nodes_entry_point
+	    ON nodes(project)
+	    WHERE json_extract(properties, '$.is_entry_point') = 1;
+
+	CREATE INDEX IF NOT EXISTS idx_nodes_is_test
+	    ON nodes(project)
+	    WHERE json_extract(properties, '$.is_test') = 1;
+
 	CREATE TABLE IF NOT EXISTS edges (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,
@@ -246,6 +292,24 @@ func (s *Store) initSchema() error {
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`)
+
+	// Migration: community_cache table for Louvain warm-start.
+	_, _ = s.db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS community_cache (
+			project    TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,
+			node_id    INTEGER NOT NULL,
+			community  INTEGER NOT NULL,
+			graph_hash TEXT NOT NULL,
+			PRIMARY KEY (project, node_id)
+		)`)
+	_, _ = s.db.ExecContext(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_community_cache_project
+			ON community_cache(project)`)
+	// Composite index for LoadCommunityCache(project, graph_hash) — turns the
+	// per-project scan on cache misses into a single B-tree seek.
+	_, _ = s.db.ExecContext(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_community_cache_lookup
+			ON community_cache(project, graph_hash)`)
 
 	// Migration: add url_path generated column to edges table.
 	// Generated columns require SQLite 3.31.0+ (mattn/go-sqlite3 supports this).
