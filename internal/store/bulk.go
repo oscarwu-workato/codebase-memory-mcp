@@ -20,6 +20,7 @@ var userIndexes = []string{
 	"idx_edges_target_type",
 	"idx_edges_source_type",
 	"idx_edges_url_path",
+	"idx_community_cache_project",
 }
 
 // DropUserIndexes drops all user-created indexes for faster bulk writes.
@@ -53,6 +54,7 @@ func (s *Store) CreateUserIndexes(ctx context.Context) error {
 		"CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(project, target_id, type)",
 		"CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(project, source_id, type)",
 		"CREATE INDEX IF NOT EXISTS idx_edges_url_path ON edges(project, url_path_gen)",
+		"CREATE INDEX IF NOT EXISTS idx_community_cache_project ON community_cache(project)",
 	}
 	for _, ddl := range indexes {
 		if _, err := s.q.Exec(ddl); err != nil {

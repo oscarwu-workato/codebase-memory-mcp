@@ -293,6 +293,19 @@ func (s *Store) initSchema() error {
 			updated_at TEXT NOT NULL
 		)`)
 
+	// Migration: community_cache table for Louvain warm-start.
+	_, _ = s.db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS community_cache (
+			project    TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,
+			node_id    INTEGER NOT NULL,
+			community  INTEGER NOT NULL,
+			graph_hash TEXT NOT NULL,
+			PRIMARY KEY (project, node_id)
+		)`)
+	_, _ = s.db.ExecContext(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_community_cache_project
+			ON community_cache(project)`)
+
 	// Migration: add url_path generated column to edges table.
 	// Generated columns require SQLite 3.31.0+ (mattn/go-sqlite3 supports this).
 	// We check if the column already exists to make this idempotent.

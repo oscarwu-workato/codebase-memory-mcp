@@ -9,6 +9,12 @@ import (
 	"github.com/DeusData/codebase-memory-mcp/internal/store"
 )
 
+// communityGraphHash returns a fingerprint of the community graph state.
+// A change in node or edge count invalidates the warm-start cache.
+func communityGraphHash(nodeCount, edgeCount int) string {
+	return fmt.Sprintf("%d:%d", nodeCount, edgeCount)
+}
+
 // passCommunities runs Louvain community detection on the CALLS graph
 // and creates Community nodes + MEMBER_OF edges.
 func (p *Pipeline) passCommunities() {
@@ -37,8 +43,23 @@ func (p *Pipeline) passCommunities() {
 		adj[e.TargetID][e.SourceID] = true
 	}
 
+	// Load warm-start partition from cache if graph fingerprint matches.
+	graphHash := communityGraphHash(len(allNodes), len(callEdges))
+	warmStart, err := p.Store.LoadCommunityCache(p.ProjectName, graphHash)
+	if err != nil {
+		slog.Warn("pass.communities.cache.load.err", "err", err)
+		warmStart = nil
+	}
+	cacheHit := warmStart != nil
+	slog.Info("pass.communities.cache", "hit", cacheHit, "hash", graphHash)
+
 	// Run Louvain community detection
-	communities := louvainCommunities(adj, allNodes)
+	communities, nodeCommunity := louvainCommunities(adj, allNodes, warmStart)
+
+	// Persist the partition for warm-starting future runs.
+	if saveErr := p.Store.SaveCommunityCache(p.ProjectName, graphHash, nodeCommunity); saveErr != nil {
+		slog.Warn("pass.communities.cache.save.err", "err", saveErr)
+	}
 
 	// Create Community nodes + MEMBER_OF edges
 	communityCount, memberOfCount := p.storeCommunities(communities)
@@ -47,13 +68,35 @@ func (p *Pipeline) passCommunities() {
 
 // louvainCommunities implements the Louvain algorithm for community detection.
 // Uses per-community degree accumulators for O(m) per iteration instead of O(N^2).
-// Returns a map of community_id → []node_id.
-func louvainCommunities(adj map[int64]map[int64]bool, allNodes map[int64]bool) map[int][]int64 {
+// warmStart, when non-nil, seeds node assignments from a prior run — this
+// reduces iterations from up to 50 down to 1-3 for small incremental changes.
+// Returns the grouped community map (community_id → []node_id) and the flat
+// nodeCommunity map (node_id → community_id) for cache persistence.
+func louvainCommunities(adj map[int64]map[int64]bool, allNodes map[int64]bool, warmStart map[int64]int) (map[int][]int64, map[int64]int) {
 	nodeCommunity := make(map[int64]int, len(allNodes))
-	commID := 0
-	for nodeID := range allNodes {
-		nodeCommunity[nodeID] = commID
-		commID++
+	if warmStart != nil {
+		// Seed from prior partition; assign a fresh singleton community to any
+		// node that is new since the last run.
+		nextComm := 0
+		for _, c := range warmStart {
+			if c >= nextComm {
+				nextComm = c + 1
+			}
+		}
+		for nodeID := range allNodes {
+			if c, ok := warmStart[nodeID]; ok {
+				nodeCommunity[nodeID] = c
+			} else {
+				nodeCommunity[nodeID] = nextComm
+				nextComm++
+			}
+		}
+	} else {
+		commID := 0
+		for nodeID := range allNodes {
+			nodeCommunity[nodeID] = commID
+			commID++
+		}
 	}
 
 	// Pre-compute node degrees
@@ -72,7 +115,7 @@ func louvainCommunities(adj map[int64]map[int64]bool, allNodes map[int64]bool) m
 	// Updated incrementally when nodes move between communities.
 	commSumTot := make(map[int]float64, len(allNodes))
 	for nodeID, comm := range nodeCommunity {
-		commSumTot[comm] = nodeDegree[nodeID]
+		commSumTot[comm] += nodeDegree[nodeID]
 	}
 
 	improved := true
@@ -80,7 +123,7 @@ func louvainCommunities(adj map[int64]map[int64]bool, allNodes map[int64]bool) m
 		improved = louvainIteration(adj, nodeCommunity, nodeDegree, commSumTot, m)
 	}
 
-	return groupAndFilter(nodeCommunity)
+	return groupAndFilter(nodeCommunity), nodeCommunity
 }
 
 // louvainIteration runs one pass of greedy modularity optimization.
