@@ -77,6 +77,13 @@ func (r *StoreRouter) ForProject(name string) (*Store, error) {
 	return s, nil
 }
 
+// ForProjectReadOnly returns a read-only store for the named project.
+// Returns an error if the project has not been indexed yet.
+func (r *StoreRouter) ForProjectReadOnly(name string) (*Store, error) {
+	dbPath := filepath.Join(r.dir, name+".db")
+	return OpenReadOnly(dbPath)
+}
+
 // AllStores opens all .db files in the cache dir and returns a name→Store map.
 func (r *StoreRouter) AllStores() map[string]*Store {
 	r.mu.Lock()
