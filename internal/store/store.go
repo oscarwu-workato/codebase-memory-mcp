@@ -114,7 +114,9 @@ func OpenPath(dbPath string) (*Store, error) {
 // settings optimal for queries: no WAL, no fsync, query_only enforcement.
 // Returns an error if the database file does not exist or is not readable.
 func OpenReadOnly(dbPath string) (*Store, error) {
-	dsn := dbPath +
+	// "file:" prefix activates SQLite URI parsing so that mode=ro is enforced:
+	// SQLite will return SQLITE_CANTOPEN instead of creating the file.
+	dsn := "file:" + dbPath +
 		"?mode=ro" +
 		"&_cache_size=-65536" +
 		"&_synchronous=OFF" +
@@ -125,6 +127,12 @@ func OpenReadOnly(dbPath string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
+	// Ping forces the driver to open the actual file, catching missing/unreadable
+	// databases immediately rather than at the first query (sql.Open is lazy).
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open read-only %s: %w", dbPath, err)
+	}
 	if _, err := db.Exec("PRAGMA query_only = ON"); err != nil {
 		// Non-fatal: older SQLite versions may not support query_only
 		_ = err
