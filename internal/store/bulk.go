@@ -21,6 +21,7 @@ var userIndexes = []string{
 	"idx_edges_source_type",
 	"idx_edges_url_path",
 	"idx_community_cache_project",
+	"idx_community_cache_lookup",
 }
 
 // DropUserIndexes drops all user-created indexes for faster bulk writes.
@@ -55,6 +56,9 @@ func (s *Store) CreateUserIndexes(ctx context.Context) error {
 		"CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(project, source_id, type)",
 		"CREATE INDEX IF NOT EXISTS idx_edges_url_path ON edges(project, url_path_gen)",
 		"CREATE INDEX IF NOT EXISTS idx_community_cache_project ON community_cache(project)",
+		// Composite index makes LoadCommunityCache(project, hash) a single B-tree seek
+		// instead of a full per-project scan on cache misses.
+		"CREATE INDEX IF NOT EXISTS idx_community_cache_lookup ON community_cache(project, graph_hash)",
 	}
 	for _, ddl := range indexes {
 		if _, err := s.q.Exec(ddl); err != nil {

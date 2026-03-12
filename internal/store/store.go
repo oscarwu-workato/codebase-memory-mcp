@@ -305,6 +305,11 @@ func (s *Store) initSchema() error {
 	_, _ = s.db.ExecContext(ctx, `
 		CREATE INDEX IF NOT EXISTS idx_community_cache_project
 			ON community_cache(project)`)
+	// Composite index for LoadCommunityCache(project, graph_hash) — turns the
+	// per-project scan on cache misses into a single B-tree seek.
+	_, _ = s.db.ExecContext(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_community_cache_lookup
+			ON community_cache(project, graph_hash)`)
 
 	// Migration: add url_path generated column to edges table.
 	// Generated columns require SQLite 3.31.0+ (mattn/go-sqlite3 supports this).

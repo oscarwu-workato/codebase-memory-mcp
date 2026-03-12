@@ -1,0 +1,16 @@
+{
+  "target": "perf/week1-week2 branch — all commits above week1-complete tag",
+  "status": "in_progress",
+  "flags": {
+    "security_focus": false,
+    "performance_critical": true,
+    "strict_mode": false,
+    "framework": "Go"
+  },
+  "current_step": "1A/1B",
+  "current_phase": 1,
+  "completed_steps": ["scope"],
+  "files_created": ["00-scope.md"],
+  "started_at": "2026-03-12T06:00:00Z",
+  "last_updated": "2026-03-12T06:00:00Z"
+}
