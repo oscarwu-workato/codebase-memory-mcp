@@ -128,7 +128,7 @@ func (s *Store) fetchAspects(project string, info *ArchitectureInfo, want map[st
 		{"hotspots", func() error { var e error; info.Hotspots, e = s.archHotspots(project); return e }},
 		{"boundaries", func() error { var e error; info.Boundaries, e = s.archBoundaries(project); return e }},
 		{"services", func() error { var e error; info.Services, e = s.archServices(project); return e }},
-		{"layers", func() error { var e error; info.Layers, e = s.archLayers(project); return e }},
+		{"layers", func() error { var e error; info.Layers, e = s.archLayers(project, info.Boundaries); return e }},
 		{"clusters", func() error { var e error; info.Clusters, e = s.archClusters(project); return e }},
 		{"file_tree", func() error { var e error; info.FileTree, e = s.archFileTree(project); return e }},
 	}
@@ -473,11 +473,17 @@ func (s *Store) archServices(project string) ([]ServiceLink, error) {
 	return result, nil
 }
 
-func (s *Store) archLayers(project string) ([]PackageLayer, error) {
-	// Get boundaries for fan-in/out analysis
-	boundaries, err := s.archBoundaries(project)
-	if err != nil {
-		return nil, err
+func (s *Store) archLayers(project string, cached []CrossPkgBoundary) ([]PackageLayer, error) {
+	// Get boundaries for fan-in/out analysis; reuse pre-computed result if available.
+	var boundaries []CrossPkgBoundary
+	if cached != nil {
+		boundaries = cached
+	} else {
+		var err error
+		boundaries, err = s.archBoundaries(project)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Check which packages have Route nodes

@@ -49,13 +49,21 @@ type Server struct {
 	indexStatus    atomic.Value
 	indexStartedAt atomic.Value // time.Time — when current/last index started
 	updateNotice   atomic.Value // string — set once by checkForUpdate, cleared after first injection
+
+	// Architecture result cache: per-project, keyed by "project:aspects", invalidated on re-index.
+	archCacheMu   sync.RWMutex
+	archCache     map[string][]byte // cache key → serialised JSON bytes
+	archCacheVer  map[string]uint64 // project → graph write version at cache time
+	graphWriteVer sync.Map          // project → uint64, incremented on each successful index
 }
 
 // NewServer creates a new MCP server with all tools registered.
 func NewServer(r *store.StoreRouter) *Server {
 	srv := &Server{
-		router:   r,
-		handlers: make(map[string]mcp.ToolHandler),
+		router:       r,
+		handlers:     make(map[string]mcp.ToolHandler),
+		archCache:    make(map[string][]byte),
+		archCacheVer: make(map[string]uint64),
 	}
 
 	srv.mcp = mcp.NewServer(
@@ -93,7 +101,25 @@ func (s *Server) syncProject(ctx context.Context, projectName, rootPath string) 
 		return fmt.Errorf("store for %s: %w", projectName, err)
 	}
 	p := pipeline.New(ctx, st, rootPath, discover.ModeFull)
-	return p.Run()
+	if err := p.Run(); err != nil {
+		return err
+	}
+	s.bumpGraphVersion(projectName)
+	s.archCacheMu.Lock()
+	delete(s.archCache, projectName)
+	s.archCacheMu.Unlock()
+	return nil
+}
+
+// bumpGraphVersion increments the graph write counter for a project.
+// Called after every successful index run to invalidate the architecture cache.
+func (s *Server) bumpGraphVersion(project string) {
+	for {
+		v, _ := s.graphWriteVer.LoadOrStore(project, uint64(0))
+		if s.graphWriteVer.CompareAndSwap(project, v, v.(uint64)+1) {
+			break
+		}
+	}
 }
 
 // MCPServer returns the underlying MCP server.
@@ -225,6 +251,10 @@ func (s *Server) startAutoIndex() {
 			slog.Warn("autoindex.err", "err", err)
 			return
 		}
+		s.bumpGraphVersion(s.sessionProject)
+		s.archCacheMu.Lock()
+		delete(s.archCache, s.sessionProject)
+		s.archCacheMu.Unlock()
 		s.indexStatus.Store("ready")
 		slog.Info("autoindex.done", "project", s.sessionProject)
 	}()
