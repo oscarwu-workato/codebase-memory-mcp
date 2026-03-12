@@ -82,7 +82,7 @@ func louvain(nodes []int64, edges []louvainEdge) map[int64]int {
 		changed, improved := louvainLocalMoving(n, adj, weight, degree, community, totalWeight, resolution)
 		louvainRefine(n, adj, weight, degree, community, totalWeight, resolution)
 
-		if !improved || float64(changed)/float64(n) < 0.001 {
+		if !improved || (n > 0 && float64(changed)/float64(n) < 0.001) {
 			break
 		}
 	}

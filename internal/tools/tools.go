@@ -52,8 +52,7 @@ type Server struct {
 
 	// Architecture result cache: per-project, keyed by "project:aspects", invalidated on re-index.
 	archCacheMu   sync.RWMutex
-	archCache     map[string][]byte // cache key → serialised JSON bytes
-	archCacheVer  map[string]uint64 // project → graph write version at cache time
+	archCache     map[string]string // cache key ("project:aspects") → serialised JSON string
 	graphWriteVer sync.Map          // project → uint64, incremented on each successful index
 }
 
@@ -62,8 +61,7 @@ func NewServer(r *store.StoreRouter) *Server {
 	srv := &Server{
 		router:       r,
 		handlers:     make(map[string]mcp.ToolHandler),
-		archCache:    make(map[string][]byte),
-		archCacheVer: make(map[string]uint64),
+		archCache: make(map[string]string),
 	}
 
 	srv.mcp = mcp.NewServer(
@@ -104,16 +102,22 @@ func (s *Server) syncProject(ctx context.Context, projectName, rootPath string) 
 	if err := p.Run(); err != nil {
 		return err
 	}
-	s.bumpGraphVersion(projectName)
-	s.archCacheMu.Lock()
-	delete(s.archCache, projectName)
-	s.archCacheMu.Unlock()
+	s.invalidateArchCache(projectName)
 	return nil
 }
 
-// bumpGraphVersion increments the graph write counter for a project.
-// Called after every successful index run to invalidate the architecture cache.
-func (s *Server) bumpGraphVersion(project string) {
+// invalidateArchCache clears all cached architecture results for the given project
+// and increments the graph write version. Called after every successful index run.
+func (s *Server) invalidateArchCache(project string) {
+	prefix := project + ":"
+	s.archCacheMu.Lock()
+	for key := range s.archCache {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.archCache, key)
+		}
+	}
+	s.archCacheMu.Unlock()
+	// Increment version counter (CAS loop handles concurrent bumps).
 	for {
 		v, _ := s.graphWriteVer.LoadOrStore(project, uint64(0))
 		if s.graphWriteVer.CompareAndSwap(project, v, v.(uint64)+1) {
@@ -251,10 +255,7 @@ func (s *Server) startAutoIndex() {
 			slog.Warn("autoindex.err", "err", err)
 			return
 		}
-		s.bumpGraphVersion(s.sessionProject)
-		s.archCacheMu.Lock()
-		delete(s.archCache, s.sessionProject)
-		s.archCacheMu.Unlock()
+		s.invalidateArchCache(s.sessionProject)
 		s.indexStatus.Store("ready")
 		slog.Info("autoindex.done", "project", s.sessionProject)
 	}()

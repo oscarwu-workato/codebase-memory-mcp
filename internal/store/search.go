@@ -173,20 +173,22 @@ func computeSQLLimit(params *SearchParams, nameHasLikeHints, qnHasLikeHints bool
 	hasDegreeFilter := params.MinDegree >= 0 || params.MaxDegree >= 0
 	needsNameScan := (params.NamePattern != "" && !nameHasLikeHints) || (params.QNPattern != "" && !qnHasLikeHints)
 
+	// Degree filtering requires scanning the full result set to count edges accurately.
+	if needsNameScan || hasDegreeFilter {
+		return 200000 // must cover full dataset for accurate Go-side filtering
+	}
+
 	// When a name pattern has extractable LIKE hints the SQL layer pre-filters rows,
 	// so a large full-table scan is unnecessary. Cap at 50K (still well above typical
 	// page sizes) to reduce row transfer. Full 200K is kept for unanchored/complex
-	// patterns that fall through to Go-side regex scanning.
+	// patterns that fall through to Go-side regex scanning. Only applies when no
+	// degree filter is active (handled above).
 	if nameHasLikeHints {
 		limit := params.Offset + params.Limit + 5000
 		if limit > 50000 {
 			limit = 50000
 		}
 		return limit
-	}
-
-	if needsNameScan || hasDegreeFilter {
-		return 200000 // must cover full dataset for accurate Go-side filtering
 	}
 	// Scan beyond offset+limit so total/has_more are accurate.
 	// The +1000 buffer ensures has_more is correct for result sets

@@ -112,11 +112,8 @@ func OpenPath(dbPath string) (*Store, error) {
 // OpenReadOnly opens an existing database in read-only mode.
 // It skips schema initialisation (tables already exist) and uses
 // settings optimal for queries: no WAL, no fsync, query_only enforcement.
-// Returns an error if the database file does not exist.
+// Returns an error if the database file does not exist or is not readable.
 func OpenReadOnly(dbPath string) (*Store, error) {
-	if _, err := os.Stat(dbPath); err != nil {
-		return nil, fmt.Errorf("database not found at %s: %w", dbPath, err)
-	}
 	dsn := dbPath +
 		"?mode=ro" +
 		"&_cache_size=-65536" +

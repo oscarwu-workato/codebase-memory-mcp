@@ -43,12 +43,12 @@ func (s *Server) handleGetArchitecture(_ context.Context, req *mcp.CallToolReque
 
 	cacheKey := projName + ":" + strings.Join(aspects, ",")
 
-	// Cache read: return serialised bytes directly on hit.
+	// Cache read: return stored JSON string directly on hit.
 	s.archCacheMu.RLock()
 	if cached, ok := s.archCache[cacheKey]; ok {
 		s.archCacheMu.RUnlock()
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: string(cached)}},
+			Content: []mcp.Content{&mcp.TextContent{Text: cached}},
 		}, nil
 	}
 	s.archCacheMu.RUnlock()
@@ -65,11 +65,11 @@ func (s *Server) handleGetArchitecture(_ context.Context, req *mcp.CallToolReque
 	result := jsonResult(responseData)
 	s.addUpdateNotice(result)
 
-	// Cache write: store serialised bytes for future hits.
+	// Cache write: store JSON string for future hits.
 	if len(result.Content) > 0 && !result.IsError {
 		if tc, ok := result.Content[0].(*mcp.TextContent); ok {
 			s.archCacheMu.Lock()
-			s.archCache[cacheKey] = []byte(tc.Text)
+			s.archCache[cacheKey] = tc.Text
 			s.archCacheMu.Unlock()
 		}
 	}
