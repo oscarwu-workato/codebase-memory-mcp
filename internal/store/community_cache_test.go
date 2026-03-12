@@ -165,35 +165,41 @@ func TestCommunityCacheProjectIsolation(t *testing.T) {
 	}
 }
 
-// TestCommunityCacheBatchBoundary249 saves exactly 249 nodes (one batch) and
-// loads them all back.
-func TestCommunityCacheBatchBoundary249(t *testing.T) {
-	s := setupCacheStore(t)
-	defer s.Close()
-
+// assertCacheRoundtrip saves partition under hash and verifies LoadCommunityCache
+// returns an identical map. Extracted because the save→load→verify pattern is
+// shared by all batch-boundary tests.
+func assertCacheRoundtrip(t *testing.T, s *Store, hash string, partition map[int64]int) {
+	t.Helper()
 	ctx := context.Background()
-	const n = 249
-	partition := make(map[int64]int, n)
-	for i := int64(1); i <= n; i++ {
-		partition[i] = int(i % 5)
-	}
-
-	if err := s.SaveCommunityCache(ctx, "test", "h249", partition); err != nil {
+	if err := s.SaveCommunityCache(ctx, "test", hash, partition); err != nil {
 		t.Fatalf("SaveCommunityCache: %v", err)
 	}
-
-	got, err := s.LoadCommunityCache(ctx, "test", "h249")
+	got, err := s.LoadCommunityCache(ctx, "test", hash)
 	if err != nil {
 		t.Fatalf("LoadCommunityCache: %v", err)
 	}
-	if len(got) != n {
-		t.Fatalf("expected %d entries, got %d", n, len(got))
+	if len(got) != len(partition) {
+		t.Fatalf("expected %d entries, got %d", len(partition), len(got))
 	}
 	for nodeID, comm := range partition {
 		if got[nodeID] != comm {
 			t.Errorf("node %d: got %d, want %d", nodeID, got[nodeID], comm)
 		}
 	}
+}
+
+// TestCommunityCacheBatchBoundary249 saves exactly 249 nodes (one batch) and
+// loads them all back.
+func TestCommunityCacheBatchBoundary249(t *testing.T) {
+	s := setupCacheStore(t)
+	defer s.Close()
+
+	const n = 249
+	partition := make(map[int64]int, n)
+	for i := int64(1); i <= n; i++ {
+		partition[i] = int(i % 5)
+	}
+	assertCacheRoundtrip(t, s, "h249", partition)
 }
 
 // TestCommunityCacheBatchBoundary250 saves 250 nodes (two batches: 249+1) and
@@ -202,29 +208,12 @@ func TestCommunityCacheBatchBoundary250(t *testing.T) {
 	s := setupCacheStore(t)
 	defer s.Close()
 
-	ctx := context.Background()
 	const n = 250 // cacheBatchSize + 1
 	partition := make(map[int64]int, n)
 	for i := int64(1); i <= n; i++ {
 		partition[i] = int(i % 5)
 	}
-
-	if err := s.SaveCommunityCache(ctx, "test", "h250", partition); err != nil {
-		t.Fatalf("SaveCommunityCache: %v", err)
-	}
-
-	got, err := s.LoadCommunityCache(ctx, "test", "h250")
-	if err != nil {
-		t.Fatalf("LoadCommunityCache: %v", err)
-	}
-	if len(got) != n {
-		t.Fatalf("expected %d entries, got %d", n, len(got))
-	}
-	for nodeID, comm := range partition {
-		if got[nodeID] != comm {
-			t.Errorf("node %d: got %d, want %d", nodeID, got[nodeID], comm)
-		}
-	}
+	assertCacheRoundtrip(t, s, "h250", partition)
 }
 
 // TestCommunityCacheBatchBoundary498 saves 498 nodes (two full batches) and
@@ -233,29 +222,12 @@ func TestCommunityCacheBatchBoundary498(t *testing.T) {
 	s := setupCacheStore(t)
 	defer s.Close()
 
-	ctx := context.Background()
 	const n = 498 // 2 * cacheBatchSize
 	partition := make(map[int64]int, n)
 	for i := int64(1); i <= n; i++ {
 		partition[i] = int(i % 7)
 	}
-
-	if err := s.SaveCommunityCache(ctx, "test", "h498", partition); err != nil {
-		t.Fatalf("SaveCommunityCache: %v", err)
-	}
-
-	got, err := s.LoadCommunityCache(ctx, "test", "h498")
-	if err != nil {
-		t.Fatalf("LoadCommunityCache: %v", err)
-	}
-	if len(got) != n {
-		t.Fatalf("expected %d entries, got %d", n, len(got))
-	}
-	for nodeID, comm := range partition {
-		if got[nodeID] != comm {
-			t.Errorf("node %d: got %d, want %d", nodeID, got[nodeID], comm)
-		}
-	}
+	assertCacheRoundtrip(t, s, "h498", partition)
 }
 
 // TestCommunityCacheEmptyPartition saves an empty map and expects nil back

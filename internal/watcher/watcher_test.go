@@ -345,7 +345,12 @@ func TestWatcherProjectForPathNoFalsePositive(t *testing.T) {
 	}
 }
 
-func TestWatcherTriggerDebouncedFires(t *testing.T) {
+// newDebouncedTestWatcher creates a Watcher backed by a fresh router rooted at
+// tmpDir and returns the watcher, a counter incremented by indexFn, and a
+// ProjectInfo for the registered project. Extracted because all three
+// triggerDebounced tests share this exact setup.
+func newDebouncedTestWatcher(t *testing.T) (*Watcher, *atomic.Int32, *store.ProjectInfo) {
+	t.Helper()
 	tmpDir := t.TempDir()
 	projName := filepath.Base(tmpDir)
 	r := newTestRouter(t, projName, tmpDir)
@@ -355,11 +360,14 @@ func TestWatcherTriggerDebouncedFires(t *testing.T) {
 		counter.Add(1)
 		return nil
 	})
-
-	ctx := context.Background()
 	proj := &store.ProjectInfo{Name: projName, RootPath: tmpDir}
+	return w, &counter, proj
+}
 
-	w.triggerDebounced(ctx, proj)
+func TestWatcherTriggerDebouncedFires(t *testing.T) {
+	w, counter, proj := newDebouncedTestWatcher(t)
+
+	w.triggerDebounced(context.Background(), proj)
 
 	// Wait longer than the debounce window.
 	time.Sleep(200 * time.Millisecond)
@@ -370,22 +378,11 @@ func TestWatcherTriggerDebouncedFires(t *testing.T) {
 }
 
 func TestWatcherTriggerDebouncedCoalesces(t *testing.T) {
-	tmpDir := t.TempDir()
-	projName := filepath.Base(tmpDir)
-	r := newTestRouter(t, projName, tmpDir)
-
-	var counter atomic.Int32
-	w := New(r, func(_ context.Context, _, _ string) error {
-		counter.Add(1)
-		return nil
-	})
-
-	ctx := context.Background()
-	proj := &store.ProjectInfo{Name: projName, RootPath: tmpDir}
+	w, counter, proj := newDebouncedTestWatcher(t)
 
 	// Call 5 times rapidly — all within the debounce window.
 	for i := 0; i < 5; i++ {
-		w.triggerDebounced(ctx, proj)
+		w.triggerDebounced(context.Background(), proj)
 	}
 
 	// Wait for the single coalesced fire.
@@ -397,19 +394,9 @@ func TestWatcherTriggerDebouncedCoalesces(t *testing.T) {
 }
 
 func TestWatcherTriggerDebouncedCtxCancel(t *testing.T) {
-	tmpDir := t.TempDir()
-	projName := filepath.Base(tmpDir)
-	r := newTestRouter(t, projName, tmpDir)
-
-	var counter atomic.Int32
-	w := New(r, func(_ context.Context, _, _ string) error {
-		counter.Add(1)
-		return nil
-	})
+	w, counter, proj := newDebouncedTestWatcher(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	proj := &store.ProjectInfo{Name: projName, RootPath: tmpDir}
-
 	w.triggerDebounced(ctx, proj)
 	// Cancel before the debounce window elapses.
 	cancel()

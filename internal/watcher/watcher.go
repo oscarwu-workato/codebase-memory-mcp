@@ -240,6 +240,33 @@ func (w *Watcher) triggerDebounced(ctx context.Context, proj *store.ProjectInfo)
 	w.debounceMu.Unlock()
 }
 
+// registerNewProjects adds fsnotify watchers for projects not yet tracked.
+func (w *Watcher) registerNewProjects(infos []*store.ProjectInfo) {
+	if w.fsw == nil {
+		return
+	}
+	w.pollMu.Lock()
+	for _, info := range infos {
+		if _, seen := w.projects[info.Name]; !seen {
+			w.addProjectDirs(info.RootPath)
+		}
+	}
+	w.pollMu.Unlock()
+}
+
+// getOrCreateState returns the poll state for a project, creating it
+// if absent. The second return value is true when the state pre-existed.
+func (w *Watcher) getOrCreateState(name string) (*projectState, bool) {
+	w.pollMu.Lock()
+	defer w.pollMu.Unlock()
+	state, exists := w.projects[name]
+	if !exists {
+		state = &projectState{}
+		w.projects[name] = state
+	}
+	return state, exists
+}
+
 // pollAll runs a snapshot comparison for all projects due for a fallback poll.
 func (w *Watcher) pollAll(ctx context.Context) {
 	projectInfos := w.refreshProjectCache()
@@ -247,16 +274,7 @@ func (w *Watcher) pollAll(ctx context.Context) {
 		return
 	}
 
-	// Register any newly-indexed projects with fsnotify.
-	if w.fsw != nil {
-		w.pollMu.Lock()
-		for _, info := range projectInfos {
-			if _, seen := w.projects[info.Name]; !seen {
-				w.addProjectDirs(info.RootPath)
-			}
-		}
-		w.pollMu.Unlock()
-	}
+	w.registerNewProjects(projectInfos)
 
 	now := time.Now()
 	for _, info := range projectInfos {
@@ -269,15 +287,8 @@ func (w *Watcher) pollAll(ctx context.Context) {
 			continue
 		}
 
-		w.pollMu.Lock()
-		state, exists := w.projects[info.Name]
-		if !exists {
-			state = &projectState{}
-			w.projects[info.Name] = state
-		}
-		w.pollMu.Unlock()
-
-		if exists && now.Before(state.nextPoll) {
+		state, existed := w.getOrCreateState(info.Name)
+		if existed && now.Before(state.nextPoll) {
 			continue
 		}
 
@@ -287,41 +298,36 @@ func (w *Watcher) pollAll(ctx context.Context) {
 
 // pollProject captures a snapshot and triggers indexFn when the tree changed.
 func (w *Watcher) pollProject(ctx context.Context, proj *store.Project, state *projectState) {
+	defer func() { state.nextPoll = time.Now().Add(fallbackInterval) }()
+
 	if _, err := os.Stat(proj.RootPath); err != nil {
 		slog.Warn("watcher.root_gone", "project", proj.Name, "path", proj.RootPath)
-		state.nextPoll = time.Now().Add(fallbackInterval)
 		return
 	}
 
 	snap, err := captureSnapshot(proj.RootPath)
 	if err != nil {
 		slog.Warn("watcher.snapshot", "project", proj.Name, "err", err)
-		state.nextPoll = time.Now().Add(fallbackInterval)
 		return
 	}
 
 	if state.snapshot == nil {
-		// First poll — capture baseline without triggering re-index.
 		slog.Debug("watcher.baseline", "project", proj.Name, "files", len(snap))
 		state.snapshot = snap
-		state.nextPoll = time.Now().Add(fallbackInterval)
 		return
 	}
 
 	if snapshotsEqual(state.snapshot, snap) {
-		state.nextPoll = time.Now().Add(fallbackInterval)
 		return
 	}
 
 	slog.Info("watcher.changed", "project", proj.Name, "files", len(snap))
 	if err := w.indexFn(ctx, proj.Name, proj.RootPath); err != nil {
 		slog.Warn("watcher.index", "project", proj.Name, "err", err)
-		state.nextPoll = time.Now().Add(fallbackInterval)
 		return
 	}
 
 	state.snapshot = snap
-	state.nextPoll = time.Now().Add(fallbackInterval)
 }
 
 // captureSnapshot walks the file tree using discover.Discover and records
