@@ -1,6 +1,43 @@
 package store
 
-import "math/rand" // WHY: graph algorithm randomness — not cryptographic use, math/rand is correct here
+import (
+	"log/slog"
+	"math/rand" // WHY: graph algorithm randomness — not cryptographic use, math/rand is correct here
+)
+
+// LouvainEdge is an exported edge type for cross-package use of the Louvain algorithm.
+type LouvainEdge struct {
+	Src int64
+	Dst int64
+}
+
+// RunLouvain runs community detection with optional warm-start and GPU acceleration.
+// If CBM_GPU=1 is set, attempts to offload to the cuGraph GPU sidecar first.
+// Falls back silently to the pure-Go implementation on any GPU failure.
+func RunLouvain(nodes []int64, edges []LouvainEdge, warmStart map[int64]int) map[int64]int {
+	if isGPUEnabled() && len(nodes) >= 3 {
+		if partition, ok := tryGPULouvain(nodes, edges); ok {
+			slog.Info("louvain.gpu.ok", "nodes", len(nodes), "edges", len(edges), "communities", communityCount(partition))
+			return partition
+		}
+		slog.Warn("louvain.gpu.fallback", "nodes", len(nodes), "edges", len(edges))
+	}
+	// Convert LouvainEdge → internal louvainEdge
+	internal := make([]louvainEdge, len(edges))
+	for i, e := range edges {
+		internal[i] = louvainEdge{src: e.Src, dst: e.Dst}
+	}
+	return louvainWithWarmStart(nodes, internal, warmStart)
+}
+
+// communityCount returns the number of distinct communities in a partition.
+func communityCount(partition map[int64]int) int {
+	seen := map[int]bool{}
+	for _, c := range partition {
+		seen[c] = true
+	}
+	return len(seen)
+}
 
 // louvainEdge represents an edge for the Louvain algorithm.
 type louvainEdge struct {
