@@ -186,9 +186,10 @@ func TestWatcherTriggersOnChange(t *testing.T) {
 	}
 
 	w := New(r, indexFn)
+	ctx := context.Background()
 
 	// First poll — baseline capture, no index
-	w.pollAll()
+	w.pollAll(ctx)
 	if indexCount.Load() != 0 {
 		t.Errorf("first poll should not trigger index, got %d", indexCount.Load())
 	}
@@ -198,7 +199,7 @@ func TestWatcherTriggersOnChange(t *testing.T) {
 	for _, state := range w.projects {
 		state.nextPoll = time.Time{}
 	}
-	w.pollAll()
+	w.pollAll(ctx)
 	if indexCount.Load() != 0 {
 		t.Errorf("no-change poll should not trigger index, got %d", indexCount.Load())
 	}
@@ -213,7 +214,7 @@ func TestWatcherTriggersOnChange(t *testing.T) {
 	for _, state := range w.projects {
 		state.nextPoll = time.Time{}
 	}
-	w.pollAll()
+	w.pollAll(ctx)
 	if indexCount.Load() != 1 {
 		t.Errorf("changed file should trigger index, got %d", indexCount.Load())
 	}
@@ -257,7 +258,7 @@ func TestWatcherSkipsMissingRoot(t *testing.T) {
 		return nil
 	})
 
-	w.pollAll()
+	w.pollAll(context.Background())
 	if indexCount.Load() != 0 {
 		t.Errorf("should not index missing root, got %d", indexCount.Load())
 	}
@@ -279,8 +280,10 @@ func TestWatcherNewFileTriggersIndex(t *testing.T) {
 		return nil
 	})
 
+	ctx := context.Background()
+
 	// Baseline
-	w.pollAll()
+	w.pollAll(ctx)
 
 	// Add a new file
 	if err := os.WriteFile(filepath.Join(tmpDir, "util.go"), []byte("package main\n"), 0o600); err != nil {
@@ -290,7 +293,7 @@ func TestWatcherNewFileTriggersIndex(t *testing.T) {
 	for _, state := range w.projects {
 		state.nextPoll = time.Time{}
 	}
-	w.pollAll()
+	w.pollAll(ctx)
 	if indexCount.Load() != 1 {
 		t.Errorf("new file should trigger index, got %d", indexCount.Load())
 	}

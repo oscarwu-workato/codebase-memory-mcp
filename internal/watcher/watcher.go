@@ -2,17 +2,22 @@ package watcher
 
 import (
 	"context"
+	"io/fs"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/DeusData/codebase-memory-mcp/internal/discover"
 	"github.com/DeusData/codebase-memory-mcp/internal/store"
+	"github.com/fsnotify/fsnotify"
 )
 
 const (
-	baseInterval = 1 * time.Second
-	maxInterval  = 60 * time.Second
+	fallbackInterval = 30 * time.Second
+	debounceWindow   = 100 * time.Millisecond
 )
 
 type fileSnapshot struct {
@@ -22,35 +27,102 @@ type fileSnapshot struct {
 
 type projectState struct {
 	snapshot map[string]fileSnapshot
-	interval time.Duration
 	nextPoll time.Time
 }
 
 // IndexFunc is the callback signature for triggering a re-index.
 type IndexFunc func(ctx context.Context, projectName, rootPath string) error
 
-// Watcher polls indexed projects for file changes and triggers re-indexing.
+// Watcher detects file changes via fsnotify (inotify/kqueue) and triggers
+// re-indexing. A snapshot-based fallback poll runs every 30 s to catch events
+// missed on network mounts or other edge cases.
 type Watcher struct {
-	router   *store.StoreRouter
-	indexFn  IndexFunc
+	router  *store.StoreRouter
+	indexFn IndexFunc
+
+	// fsnotify watcher; nil when fsnotify is unavailable.
+	fsw *fsnotify.Watcher
+
+	// debounce: project name → pending timer.
+	debounceMu  sync.Mutex
+	debounceMap map[string]*time.Timer
+
+	// fallback poll state (snapshot comparison).
+	pollMu   sync.Mutex
 	projects map[string]*projectState
-	ctx      context.Context
 }
 
 // New creates a Watcher. indexFn is called when file changes are detected.
 func New(r *store.StoreRouter, indexFn IndexFunc) *Watcher {
 	return &Watcher{
-		router:   r,
-		indexFn:  indexFn,
-		projects: make(map[string]*projectState),
+		router:      r,
+		indexFn:     indexFn,
+		debounceMap: make(map[string]*time.Timer),
+		projects:    make(map[string]*projectState),
 	}
 }
 
-// Run blocks until ctx is cancelled. Ticks at baseInterval, polling each
-// project only when its adaptive interval has elapsed.
+// Run blocks until ctx is cancelled. It starts fsnotify watching for
+// instant detection and a 30 s fallback poll as a safety net.
 func (w *Watcher) Run(ctx context.Context) {
-	w.ctx = ctx
-	ticker := time.NewTicker(baseInterval)
+	fsw, err := fsnotify.NewWatcher()
+	if err != nil {
+		slog.Warn("watcher.fsnotify_unavailable", "err", err, "fallback", "poll_only")
+	} else {
+		w.fsw = fsw
+		defer fsw.Close()
+
+		// Register all directories for currently-indexed projects.
+		w.watchAllProjects()
+
+		go w.runFSNotify(ctx)
+	}
+
+	w.runFallbackPoll(ctx)
+}
+
+// runFSNotify processes fsnotify events until ctx is cancelled.
+func (w *Watcher) runFSNotify(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-w.fsw.Events:
+			if !ok {
+				return
+			}
+			w.handleFSEvent(ctx, event)
+		case err, ok := <-w.fsw.Errors:
+			if !ok {
+				return
+			}
+			slog.Warn("watcher.fsnotify_err", "err", err)
+		}
+	}
+}
+
+// handleFSEvent routes a single fsnotify event to the owning project.
+func (w *Watcher) handleFSEvent(ctx context.Context, event fsnotify.Event) {
+	// When a new directory is created, watch it immediately so new files
+	// inside it are caught without waiting for a fallback poll.
+	if event.Has(fsnotify.Create) {
+		if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+			if addErr := w.fsw.Add(event.Name); addErr != nil {
+				slog.Debug("watcher.add_dir", "path", event.Name, "err", addErr)
+			}
+		}
+	}
+
+	proj, ok := w.projectForPath(event.Name)
+	if !ok {
+		return
+	}
+	w.triggerDebounced(ctx, proj)
+}
+
+// runFallbackPoll runs the snapshot-based poll loop at a fixed 30 s interval.
+func (w *Watcher) runFallbackPoll(ctx context.Context) {
+	ticker := time.NewTicker(fallbackInterval)
 	defer ticker.Stop()
 
 	for {
@@ -58,97 +130,169 @@ func (w *Watcher) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			w.pollAll()
+			w.pollAll(ctx)
 		}
 	}
 }
 
-// pollAll lists all indexed projects and polls each that is due.
-func (w *Watcher) pollAll() {
+// watchAllProjects registers fsnotify watchers for all known indexed projects.
+func (w *Watcher) watchAllProjects() {
+	infos, err := w.router.ListProjects()
+	if err != nil {
+		slog.Warn("watcher.list_projects", "err", err)
+		return
+	}
+	for _, info := range infos {
+		w.addProjectDirs(info.RootPath)
+	}
+}
+
+// addProjectDirs recursively adds all subdirectories of rootPath to fsw.
+func (w *Watcher) addProjectDirs(rootPath string) {
+	if w.fsw == nil {
+		return
+	}
+	walkErr := filepath.WalkDir(rootPath, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // skip unreadable entries
+		}
+		if d.IsDir() {
+			if addErr := w.fsw.Add(path); addErr != nil {
+				slog.Debug("watcher.add_dir", "path", path, "err", addErr)
+			}
+		}
+		return nil
+	})
+	if walkErr != nil {
+		slog.Debug("watcher.walk_err", "root", rootPath, "err", walkErr)
+	}
+}
+
+// projectForPath finds the indexed project whose RootPath is a prefix of path.
+func (w *Watcher) projectForPath(path string) (*store.ProjectInfo, bool) {
+	infos, err := w.router.ListProjects()
+	if err != nil {
+		return nil, false
+	}
+	for _, info := range infos {
+		root := info.RootPath
+		if !strings.HasSuffix(root, string(filepath.Separator)) {
+			root += string(filepath.Separator)
+		}
+		if strings.HasPrefix(path, root) || path == info.RootPath {
+			return info, true
+		}
+	}
+	return nil, false
+}
+
+// triggerDebounced coalesces rapid events for a project into a single re-index
+// fired after a 100 ms quiet window.
+func (w *Watcher) triggerDebounced(ctx context.Context, proj *store.ProjectInfo) {
+	w.debounceMu.Lock()
+	if t, ok := w.debounceMap[proj.Name]; ok {
+		t.Reset(debounceWindow)
+	} else {
+		name := proj.Name
+		rootPath := proj.RootPath
+		w.debounceMap[proj.Name] = time.AfterFunc(debounceWindow, func() {
+			if err := w.indexFn(ctx, name, rootPath); err != nil {
+				slog.Warn("watcher.index", "project", name, "err", err)
+			}
+			w.debounceMu.Lock()
+			delete(w.debounceMap, name)
+			w.debounceMu.Unlock()
+		})
+	}
+	w.debounceMu.Unlock()
+}
+
+// pollAll runs a snapshot comparison for all projects due for a fallback poll.
+func (w *Watcher) pollAll(ctx context.Context) {
 	projectInfos, err := w.router.ListProjects()
 	if err != nil {
 		slog.Warn("watcher.list_projects", "err", err)
 		return
 	}
 
+	// Register any newly-indexed projects with fsnotify.
+	if w.fsw != nil {
+		w.pollMu.Lock()
+		for _, info := range projectInfos {
+			if _, seen := w.projects[info.Name]; !seen {
+				w.addProjectDirs(info.RootPath)
+			}
+		}
+		w.pollMu.Unlock()
+	}
+
 	now := time.Now()
 	for _, info := range projectInfos {
-		// Get the store for this project (never cache directly)
 		st, stErr := w.router.ForProject(info.Name)
 		if stErr != nil {
 			continue
 		}
-
-		// Get the project metadata from the store
 		proj, projErr := st.GetProject(info.Name)
 		if projErr != nil || proj == nil {
 			continue
 		}
 
+		w.pollMu.Lock()
 		state, exists := w.projects[info.Name]
 		if !exists {
 			state = &projectState{}
 			w.projects[info.Name] = state
 		}
+		w.pollMu.Unlock()
 
 		if exists && now.Before(state.nextPoll) {
-			continue // not due yet
+			continue
 		}
 
-		w.pollProject(proj, state)
+		w.pollProject(ctx, proj, state)
 	}
 }
 
-// pollProject captures a snapshot of the file tree and compares with previous.
-// First poll: captures baseline without triggering indexing.
-// Subsequent polls: triggers indexFn if any file changed.
-func (w *Watcher) pollProject(proj *store.Project, state *projectState) {
-	// Verify root path still exists
+// pollProject captures a snapshot and triggers indexFn when the tree changed.
+func (w *Watcher) pollProject(ctx context.Context, proj *store.Project, state *projectState) {
 	if _, err := os.Stat(proj.RootPath); err != nil {
 		slog.Warn("watcher.root_gone", "project", proj.Name, "path", proj.RootPath)
-		state.nextPoll = time.Now().Add(maxInterval)
+		state.nextPoll = time.Now().Add(fallbackInterval)
 		return
 	}
 
 	snap, err := captureSnapshot(proj.RootPath)
 	if err != nil {
 		slog.Warn("watcher.snapshot", "project", proj.Name, "err", err)
-		state.nextPoll = time.Now().Add(state.interval)
+		state.nextPoll = time.Now().Add(fallbackInterval)
 		return
 	}
 
-	interval := pollInterval(len(snap))
-
 	if state.snapshot == nil {
-		// First poll — capture baseline, no index trigger
+		// First poll — capture baseline without triggering re-index.
 		slog.Debug("watcher.baseline", "project", proj.Name, "files", len(snap))
 		state.snapshot = snap
-		state.interval = interval
-		state.nextPoll = time.Now().Add(interval)
+		state.nextPoll = time.Now().Add(fallbackInterval)
 		return
 	}
 
 	if snapshotsEqual(state.snapshot, snap) {
-		state.interval = interval
-		state.nextPoll = time.Now().Add(interval)
+		state.nextPoll = time.Now().Add(fallbackInterval)
 		return
 	}
 
 	slog.Info("watcher.changed", "project", proj.Name, "files", len(snap))
-	if err := w.indexFn(w.ctx, proj.Name, proj.RootPath); err != nil {
+	if err := w.indexFn(ctx, proj.Name, proj.RootPath); err != nil {
 		slog.Warn("watcher.index", "project", proj.Name, "err", err)
-		// Keep old snapshot so we retry next cycle
-		state.nextPoll = time.Now().Add(interval)
+		state.nextPoll = time.Now().Add(fallbackInterval)
 		return
 	}
 
-	// Successful index — update snapshot and recalculate interval
 	state.snapshot = snap
-	state.interval = pollInterval(len(snap))
-	state.nextPoll = time.Now().Add(state.interval)
+	state.nextPoll = time.Now().Add(fallbackInterval)
 }
 
-// captureSnapshot walks the file tree using discover.Discover and captures
+// captureSnapshot walks the file tree using discover.Discover and records
 // mtime+size for each file.
 func captureSnapshot(rootPath string) (map[string]fileSnapshot, error) {
 	files, err := discover.Discover(context.Background(), rootPath, nil)
@@ -170,7 +314,8 @@ func captureSnapshot(rootPath string) (map[string]fileSnapshot, error) {
 	return snap, nil
 }
 
-// snapshotsEqual returns true if two snapshots have identical files with same mtime+size.
+// snapshotsEqual returns true if both snapshots contain the same files with
+// identical mtime and size.
 func snapshotsEqual(a, b map[string]fileSnapshot) bool {
 	if len(a) != len(b) {
 		return false
@@ -187,8 +332,8 @@ func snapshotsEqual(a, b map[string]fileSnapshot) bool {
 	return true
 }
 
-// pollInterval computes the adaptive interval from file count.
-// 1s base + 1s per 500 files, capped at 60s.
+// pollInterval is retained for tests that reference it directly.
+// It computes the adaptive interval from file count (kept for test compatibility).
 func pollInterval(fileCount int) time.Duration {
 	ms := 1000 + (fileCount/500)*1000
 	if ms > 60000 {
