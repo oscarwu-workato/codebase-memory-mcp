@@ -324,22 +324,31 @@ func (p *Pipeline) runFullPasses(files []discover.FileInfo) error {
 	p.buf = nil
 
 	// Post-flush passes use Store directly (need indexes).
+	// passTests (TESTS/TESTS_FILE) and passHTTPLinks (Route nodes + HTTP_CALLS/HANDLES/ASYNC_CALLS)
+	// write to disjoint tables, so they can run concurrently.
 	t = time.Now()
-	p.passTests() // TESTS/TESTS_FILE edges (DB-only)
-	slog.Info("pass.timing", "pass", "tests", "elapsed", time.Since(t))
+	{
+		g := new(errgroup.Group)
+		g.Go(func() error {
+			p.passTests()
+			return nil
+		})
+		g.Go(func() error {
+			if err := p.passHTTPLinks(); err != nil {
+				slog.Warn("pass.httplink.err", "err", err)
+			}
+			return nil
+		})
+		_ = g.Wait() // neither goroutine returns a non-nil error
+	}
+	slog.Info("pass.timing", "pass", "tests+httplinks", "elapsed", time.Since(t))
 
 	t = time.Now()
-	p.passCommunities() // Community nodes + MEMBER_OF edges (DB-only)
+	p.passCommunities() // Community nodes + MEMBER_OF edges (DB-only); must follow CALLS writes
 	slog.Info("pass.timing", "pass", "communities", "elapsed", time.Since(t))
 	if err := p.checkCancel(); err != nil {
 		return err
 	}
-
-	t = time.Now()
-	if err := p.passHTTPLinks(); err != nil {
-		slog.Warn("pass.httplink.err", "err", err)
-	}
-	slog.Info("pass.timing", "pass", "httplinks", "elapsed", time.Since(t))
 
 	t = time.Now()
 	p.passConfigLinker()
@@ -490,10 +499,16 @@ func (p *Pipeline) runIncrementalPasses(
 	_ = p.Store.DeleteEdgesByType(p.ProjectName, "DECORATES")
 	p.passDecorates()
 
-	// Community detection: delete old communities and MEMBER_OF, re-run
+	// Community detection: delete old communities and MEMBER_OF, re-run only when needed.
+	// Skip if all changed files are leaf nodes (no outbound CALLS edges) — editing a leaf
+	// cannot change which community any node belongs to.
 	_ = p.Store.DeleteEdgesByType(p.ProjectName, "MEMBER_OF")
 	_ = p.Store.DeleteNodesByLabel(p.ProjectName, "Community")
-	p.passCommunities()
+	if p.changedFilesAffectCommunities(changed) {
+		p.passCommunities()
+	} else {
+		slog.Debug("pipeline.communities.skip", "reason", "leaf_changes_only")
+	}
 	if err := p.checkCancel(); err != nil {
 		return err
 	}
@@ -512,6 +527,33 @@ func (p *Pipeline) runIncrementalPasses(
 	p.logEdgeCounts()
 
 	return nil
+}
+
+// changedFilesAffectCommunities returns true if any node defined in the changed files
+// has outbound CALLS edges, meaning community structure may have shifted.
+// Leaf files (no outbound calls) cannot affect communities.
+func (p *Pipeline) changedFilesAffectCommunities(changedFiles []discover.FileInfo) bool {
+	if len(changedFiles) == 0 {
+		return false
+	}
+	var nodeIDs []int64
+	for _, f := range changedFiles {
+		nodes, err := p.Store.FindNodesByFile(p.ProjectName, f.RelPath)
+		if err != nil {
+			return true // conservative: assume affects communities on error
+		}
+		for _, n := range nodes {
+			nodeIDs = append(nodeIDs, n.ID)
+		}
+	}
+	if len(nodeIDs) == 0 {
+		return true // conservative: no nodes found, may be a new file
+	}
+	edgeMap, err := p.Store.FindEdgesBySourceIDs(nodeIDs, []string{"CALLS"})
+	if err != nil {
+		return true // conservative
+	}
+	return len(edgeMap) > 0
 }
 
 // classifyFiles splits files into changed and unchanged based on stored hashes.

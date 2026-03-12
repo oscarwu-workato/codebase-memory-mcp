@@ -77,12 +77,12 @@ func louvain(nodes []int64, edges []louvainEdge) map[int64]int {
 	}
 
 	// Main Louvain loop
-	maxIter := 10
+	maxIter := 15 // was 10; extra headroom, but early-exit fires first
 	for iter := 0; iter < maxIter; iter++ {
-		improved := louvainLocalMoving(n, adj, weight, degree, community, totalWeight, resolution)
+		changed, improved := louvainLocalMoving(n, adj, weight, degree, community, totalWeight, resolution)
 		louvainRefine(n, adj, weight, degree, community, totalWeight, resolution)
 
-		if !improved {
+		if !improved || float64(changed)/float64(n) < 0.001 {
 			break
 		}
 	}
@@ -96,9 +96,9 @@ func louvain(nodes []int64, edges []louvainEdge) map[int64]int {
 }
 
 // louvainLocalMoving greedily moves each node to the community that maximizes modularity gain.
-// Returns true if any node was moved.
-func louvainLocalMoving(n int, adj [][]int, weight [][]float64, degree []float64, community []int, totalWeight, resolution float64) bool {
-	improved := false
+// Returns the count of moved nodes and whether any node was moved.
+func louvainLocalMoving(n int, adj [][]int, weight [][]float64, degree []float64, community []int, totalWeight, resolution float64) (int, bool) {
+	changed := 0
 
 	// Community total degree
 	commDegree := make(map[int]float64)
@@ -149,11 +149,11 @@ func louvainLocalMoving(n int, adj [][]int, weight [][]float64, degree []float64
 		commDegree[bestComm] += degree[i]
 
 		if bestComm != curComm {
-			improved = true
+			changed++
 		}
 	}
 
-	return improved
+	return changed, changed > 0
 }
 
 // louvainRefine checks each community for well-connectedness and potentially splits
