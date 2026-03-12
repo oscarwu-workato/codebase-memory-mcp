@@ -23,13 +23,17 @@ type FunctionRegistry struct {
 	exact map[string]string
 	// byName maps simpleName -> []qualifiedName for reverse lookup
 	byName map[string][]string
+
+	failedMu     sync.RWMutex
+	failedLookups map[string]bool // simple name → known unresolvable; avoids repeated project-wide scans
 }
 
 // NewFunctionRegistry creates an empty registry.
 func NewFunctionRegistry() *FunctionRegistry {
 	return &FunctionRegistry{
-		exact:  make(map[string]string),
-		byName: make(map[string][]string),
+		exact:         make(map[string]string),
+		byName:        make(map[string][]string),
+		failedLookups: make(map[string]bool),
 	}
 }
 
@@ -130,6 +134,16 @@ func (r *FunctionRegistry) resolveViaNameLookup(calleeName, suffix, moduleQN str
 		lookupName = suffix
 	}
 	simple := simpleName(lookupName)
+
+	// Check the failed-lookup cache before doing any work. This avoids repeated
+	// project-wide scans for stdlib/external names that will never resolve.
+	r.failedMu.RLock()
+	_, known := r.failedLookups[simple]
+	r.failedMu.RUnlock()
+	if known {
+		return ResolutionResult{}
+	}
+
 	candidates := r.byName[simple]
 
 	// Strategy 3: unique name — single candidate project-wide
@@ -148,7 +162,16 @@ func (r *FunctionRegistry) resolveViaNameLookup(calleeName, suffix, moduleQN str
 		}
 	}
 
-	return pickBestCandidate(candidates, moduleQN, importMap)
+	result := pickBestCandidate(candidates, moduleQN, importMap)
+
+	// Cache unresolvable names so future calls skip the lookup entirely.
+	if result.QualifiedName == "" {
+		r.failedMu.Lock()
+		r.failedLookups[simple] = true
+		r.failedMu.Unlock()
+	}
+
+	return result
 }
 
 // resolveSuffixMatch handles Strategy 4 — suffix-based matching among multiple candidates.
