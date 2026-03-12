@@ -209,34 +209,32 @@ func (w *Watcher) projectForPath(path string) (*store.ProjectInfo, bool) {
 
 // triggerDebounced coalesces rapid events for a project into a single re-index
 // fired after a 100 ms quiet window.
+//
+// Note on timer safety: for AfterFunc timers, Stop()+Reset() is a data race
+// if the callback is already executing. We avoid this by always stopping the
+// old timer and creating a fresh AfterFunc — one extra goroutine allocation
+// per coalesced burst is far cheaper than the race.
 func (w *Watcher) triggerDebounced(ctx context.Context, proj *store.ProjectInfo) {
-	w.debounceMu.Lock()
-	if t, ok := w.debounceMap[proj.Name]; ok {
-		// Stop before Reset per Go docs to avoid racing on a fired timer.
-		t.Stop()
-		t.Reset(debounceWindow)
-	} else {
-		name := proj.Name
-		rootPath := proj.RootPath
-		w.debounceMap[proj.Name] = time.AfterFunc(debounceWindow, func() {
-			// Skip indexing if the watcher context was cancelled while the
-			// timer was pending (avoids error noise on graceful shutdown).
-			select {
-			case <-ctx.Done():
-				w.debounceMu.Lock()
-				delete(w.debounceMap, name)
-				w.debounceMu.Unlock()
-				return
-			default:
-			}
+	name := proj.Name
+	rootPath := proj.RootPath
+	callback := func() {
+		select {
+		case <-ctx.Done():
+		default:
 			if err := w.indexFn(ctx, name, rootPath); err != nil {
 				slog.Warn("watcher.index", "project", name, "err", err)
 			}
-			w.debounceMu.Lock()
-			delete(w.debounceMap, name)
-			w.debounceMu.Unlock()
-		})
+		}
+		w.debounceMu.Lock()
+		delete(w.debounceMap, name)
+		w.debounceMu.Unlock()
 	}
+
+	w.debounceMu.Lock()
+	if t, ok := w.debounceMap[name]; ok {
+		t.Stop() // ignore return value — we're replacing the timer regardless
+	}
+	w.debounceMap[name] = time.AfterFunc(debounceWindow, callback)
 	w.debounceMu.Unlock()
 }
 
@@ -370,12 +368,3 @@ func snapshotsEqual(a, b map[string]fileSnapshot) bool {
 	return true
 }
 
-// pollInterval is retained for tests that reference it directly.
-// It computes the adaptive interval from file count (kept for test compatibility).
-func pollInterval(fileCount int) time.Duration {
-	ms := 1000 + (fileCount/500)*1000
-	if ms > 60000 {
-		ms = 60000
-	}
-	return time.Duration(ms) * time.Millisecond
-}

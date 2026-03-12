@@ -3,6 +3,7 @@ module github.com/DeusData/codebase-memory-mcp
 go 1.26
 
 require (
+	github.com/fsnotify/fsnotify v1.9.0
 	github.com/mattn/go-sqlite3 v1.14.34
 	github.com/modelcontextprotocol/go-sdk v1.4.0
 	github.com/zeebo/xxh3 v1.1.0
@@ -12,7 +13,6 @@ require (
 )
 
 require (
-	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/google/jsonschema-go v0.4.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
 	github.com/segmentio/asm v1.1.3 // indirect

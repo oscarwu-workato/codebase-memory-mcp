@@ -89,28 +89,6 @@ func TestSnapshotsEqual(t *testing.T) {
 	}
 }
 
-func TestPollInterval(t *testing.T) {
-	tests := []struct {
-		files    int
-		expected time.Duration
-	}{
-		{0, 1 * time.Second},
-		{70, 1 * time.Second},
-		{499, 1 * time.Second},
-		{500, 2 * time.Second},
-		{2000, 5 * time.Second},
-		{5000, 11 * time.Second},
-		{10000, 21 * time.Second},
-		{50000, 60 * time.Second},
-		{100000, 60 * time.Second},
-	}
-	for _, tt := range tests {
-		got := pollInterval(tt.files)
-		if got != tt.expected {
-			t.Errorf("pollInterval(%d) = %v, want %v", tt.files, got, tt.expected)
-		}
-	}
-}
 
 func TestCaptureSnapshot(t *testing.T) {
 	tmpDir := t.TempDir()

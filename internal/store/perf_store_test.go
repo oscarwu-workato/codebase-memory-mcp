@@ -377,3 +377,91 @@ func TestArchLayersWithCached(t *testing.T) {
 		t.Errorf("cached=%d layers, nil=%d layers — should be equal", len(layersCached), len(layersNil))
 	}
 }
+
+// --- validateProjectName tests (security: path-traversal prevention) ---
+
+// TestValidateProjectNameRejectsInvalid verifies that path-traversal payloads
+// and other invalid names are rejected by ForProject, ForProjectReadOnly,
+// and DeleteProject before they can escape the cache directory.
+func TestValidateProjectNameRejectsInvalid(t *testing.T) {
+	cases := []struct {
+		name  string
+		label string
+	}{
+		{"../../etc/passwd", "path traversal"},
+		{"..", "dot-dot"},
+		{"a/b", "slash"},
+		{"a\\b", "backslash"},
+		{"a b", "space"},
+		{"a*b", "wildcard"},
+		{"", "empty string"},
+		{"a|b", "pipe"},
+		{"a;b", "semicolon"},
+	}
+	for _, tc := range cases {
+		dir := t.TempDir()
+		r, err := NewRouterWithDir(dir)
+		if err != nil {
+			t.Fatalf("%s: NewRouterWithDir: %v", tc.label, err)
+		}
+		if _, err := r.ForProject(tc.name); err == nil {
+			t.Errorf("ForProject(%q) [%s]: expected error, got nil", tc.name, tc.label)
+		}
+		if _, err := r.ForProjectReadOnly(tc.name); err == nil {
+			t.Errorf("ForProjectReadOnly(%q) [%s]: expected error, got nil", tc.name, tc.label)
+		}
+		if err := r.DeleteProject(tc.name); err == nil {
+			t.Errorf("DeleteProject(%q) [%s]: expected error, got nil", tc.name, tc.label)
+		}
+	}
+}
+
+// TestValidateProjectNameAcceptsValid verifies that well-formed project names
+// are allowed through the validation boundary.
+func TestValidateProjectNameAcceptsValid(t *testing.T) {
+	valid := []string{"my-project", "repo.v2", "My_App123", "a", "x-y-z"}
+	for _, name := range valid {
+		dir := t.TempDir()
+		r, err := NewRouterWithDir(dir)
+		if err != nil {
+			t.Fatalf("%s: NewRouterWithDir: %v", name, err)
+		}
+		if _, err := r.ForProject(name); err != nil {
+			t.Errorf("ForProject(%q): expected nil error for valid name, got: %v", name, err)
+		}
+	}
+}
+
+// TestCommunityCacheLookupIndexExists verifies that both community_cache indexes
+// (single-column and composite) are created by initSchema / OpenMemory.
+func TestCommunityCacheLookupIndexExists(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer s.Close()
+
+	rows, err := s.DB().QueryContext(context.Background(), `SELECT name FROM pragma_index_list('community_cache')`)
+	if err != nil {
+		t.Fatalf("pragma_index_list: %v", err)
+	}
+	defer rows.Close()
+
+	found := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		found[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
+	}
+
+	for _, idx := range []string{"idx_community_cache_project", "idx_community_cache_lookup"} {
+		if !found[idx] {
+			t.Errorf("expected index %q in community_cache, found: %v", idx, found)
+		}
+	}
+}

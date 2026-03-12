@@ -10,9 +10,10 @@ import (
 	"sync"
 )
 
-// validProjectName matches safe project names: alphanumeric, hyphen, underscore, dot.
-// Prevents path traversal via crafted names like "../../etc/passwd".
-var validProjectName = regexp.MustCompile(`^[A-Za-z0-9._\-]+$`)
+// validProjectName matches safe project names: must start with alphanumeric,
+// then may contain alphanumeric, hyphen, underscore, or dot.
+// Prevents path traversal (../../..) and dot-only names like "..".
+var validProjectName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 // validateProjectName returns an error if name would escape the cache directory.
 func validateProjectName(name string) error {

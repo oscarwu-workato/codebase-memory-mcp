@@ -2,8 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"strings"
 )
 
@@ -60,12 +58,11 @@ func (s *Store) SaveCommunityCache(ctx context.Context, project, graphHash strin
 func (s *Store) LoadCommunityCache(ctx context.Context, project, graphHash string) (map[int64]int, error) {
 	// Single query: filter by both project and graph_hash so an empty result
 	// set means cache miss (no need for a separate hash-check query).
+	// QueryContext never returns sql.ErrNoRows — zero rows appear as an empty
+	// result set (rows with no iterations), not as an error.
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT node_id, community FROM community_cache WHERE project = ? AND graph_hash = ?`,
 		project, graphHash)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
 	if err != nil {
 		return nil, err
 	}
