@@ -36,20 +36,21 @@ func (p *Pipeline) passCommunities() {
 		return
 	}
 
-	// Build adjacency list (undirected for community detection)
-	adj := make(map[int64]map[int64]bool)
+	// Collect all node IDs from edges
 	allNodes := make(map[int64]bool)
 	for _, e := range callEdges {
 		allNodes[e.SourceID] = true
 		allNodes[e.TargetID] = true
-		if adj[e.SourceID] == nil {
-			adj[e.SourceID] = make(map[int64]bool)
-		}
-		if adj[e.TargetID] == nil {
-			adj[e.TargetID] = make(map[int64]bool)
-		}
-		adj[e.SourceID][e.TargetID] = true
-		adj[e.TargetID][e.SourceID] = true
+	}
+	nodeIDs := make([]int64, 0, len(allNodes))
+	for id := range allNodes {
+		nodeIDs = append(nodeIDs, id)
+	}
+
+	// Convert call edges to store.LouvainEdge
+	louvainEdges := make([]store.LouvainEdge, len(callEdges))
+	for i, e := range callEdges {
+		louvainEdges[i] = store.LouvainEdge{Src: e.SourceID, Dst: e.TargetID}
 	}
 
 	// Load warm-start partition from cache if graph fingerprint matches.
@@ -62,8 +63,10 @@ func (p *Pipeline) passCommunities() {
 	}
 	slog.Info("pass.communities.cache", "hit", warmStart != nil, "hash", graphHash)
 
-	// Run Louvain community detection
-	communities, nodeCommunity := louvainCommunities(adj, allNodes, warmStart)
+	// Run Louvain community detection via store.RunLouvain
+	partition := store.RunLouvain(nodeIDs, louvainEdges, warmStart)
+	nodeCommunity := partition
+	communities := groupAndFilter(partition)
 
 	// Persist the partition for warm-starting future runs.
 	if saveErr := p.Store.SaveCommunityCache(ctx, p.ProjectName, graphHash, nodeCommunity); saveErr != nil {
@@ -73,123 +76,6 @@ func (p *Pipeline) passCommunities() {
 	// Create Community nodes + MEMBER_OF edges
 	communityCount, memberOfCount := p.storeCommunities(communities)
 	slog.Info("pass.communities.done", "communities", communityCount, "member_of", memberOfCount)
-}
-
-// initNodeCommunities assigns initial community IDs to nodes, optionally
-// seeded from a warm-start partition. New nodes not in warmStart get fresh IDs.
-func initNodeCommunities(allNodes map[int64]bool, warmStart map[int64]int) map[int64]int {
-	nodeCommunity := make(map[int64]int, len(allNodes))
-	if warmStart == nil {
-		commID := 0
-		for nodeID := range allNodes {
-			nodeCommunity[nodeID] = commID
-			commID++
-		}
-		return nodeCommunity
-	}
-
-	nextComm := 0
-	for _, c := range warmStart {
-		if c >= nextComm {
-			nextComm = c + 1
-		}
-	}
-	for nodeID := range allNodes {
-		if c, ok := warmStart[nodeID]; ok {
-			nodeCommunity[nodeID] = c
-		} else {
-			nodeCommunity[nodeID] = nextComm
-			nextComm++
-		}
-	}
-	return nodeCommunity
-}
-
-// louvainCommunities implements the Louvain algorithm for community detection.
-// Uses per-community degree accumulators for O(m) per iteration instead of O(N^2).
-// warmStart, when non-nil, seeds node assignments from a prior run, reducing
-// iterations from up to 50 down to 1-3 for small incremental changes.
-// Returns the grouped community map and the flat nodeCommunity map for caching.
-func louvainCommunities(adj map[int64]map[int64]bool, allNodes map[int64]bool, warmStart map[int64]int) (map[int][]int64, map[int64]int) {
-	nodeCommunity := initNodeCommunities(allNodes, warmStart)
-
-	nodeDegree := make(map[int64]float64, len(allNodes))
-	totalEdges := 0
-	for nodeID, neighbors := range adj {
-		nodeDegree[nodeID] = float64(len(neighbors))
-		totalEdges += len(neighbors)
-	}
-	m := float64(totalEdges) / 2.0
-	if m == 0 {
-		m = 1
-	}
-
-	commSumTot := make(map[int]float64, len(allNodes))
-	for nodeID, comm := range nodeCommunity {
-		commSumTot[comm] += nodeDegree[nodeID]
-	}
-
-	improved := true
-	for iteration := 0; improved && iteration < 50; iteration++ {
-		improved = louvainIteration(adj, nodeCommunity, nodeDegree, commSumTot, m)
-	}
-
-	return groupAndFilter(nodeCommunity), nodeCommunity
-}
-
-// louvainIteration runs one pass of greedy modularity optimization.
-// For each node, computes modularity gain for neighboring communities in O(degree)
-// using pre-maintained commSumTot accumulators. Returns true if any node moved.
-func louvainIteration(
-	adj map[int64]map[int64]bool,
-	nodeCommunity map[int64]int,
-	nodeDegree map[int64]float64,
-	commSumTot map[int]float64,
-	m float64,
-) bool {
-	improved := false
-	m2 := 2.0 * m * m
-
-	for nodeID, neighbors := range adj {
-		currentComm := nodeCommunity[nodeID]
-		ki := nodeDegree[nodeID]
-
-		// Aggregate edges to each neighboring community: O(degree)
-		edgesToComm := make(map[int]float64, len(neighbors))
-		for neighborID := range neighbors {
-			edgesToComm[nodeCommunity[neighborID]]++
-		}
-
-		// Remove self from current community for fair comparison
-		commSumTot[currentComm] -= ki
-		kiInCurrent := edgesToComm[currentComm]
-		removeCost := kiInCurrent/m - ki*commSumTot[currentComm]/m2
-
-		bestComm := currentComm
-		bestGain := 0.0
-
-		for comm, kiIn := range edgesToComm {
-			if comm == currentComm {
-				continue
-			}
-			gain := kiIn/m - ki*commSumTot[comm]/m2 - removeCost
-			if gain > bestGain {
-				bestGain = gain
-				bestComm = comm
-			}
-		}
-
-		// Restore / update accumulator
-		if bestComm != currentComm && bestGain > 1e-10 {
-			nodeCommunity[nodeID] = bestComm
-			commSumTot[bestComm] += ki
-			// currentComm already had ki subtracted
-			improved = true
-		} else {
-			commSumTot[currentComm] += ki // restore
-		}
-	}
-	return improved
 }
 
 // groupAndFilter groups nodes by community and filters out singletons.
