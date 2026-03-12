@@ -4,6 +4,15 @@ import (
 	"testing"
 )
 
+// addTestEdge adds an undirected weighted edge to the adjacency / weight slices
+// used by louvainLocalMoving tests.
+func addTestEdge(adj [][]int, weight [][]float64, a, b int, w float64) {
+	adj[a] = append(adj[a], b)
+	weight[a] = append(weight[a], w)
+	adj[b] = append(adj[b], a)
+	weight[b] = append(weight[b], w)
+}
+
 // --- louvainLocalMoving tests ---
 
 // TestLouvainLocalMovingNoMoves verifies that when two fully-connected clusters
@@ -17,22 +26,15 @@ func TestLouvainLocalMovingNoMoves(t *testing.T) {
 	adj := make([][]int, n)
 	weight := make([][]float64, n)
 
-	addEdge := func(a, b int, w float64) {
-		adj[a] = append(adj[a], b)
-		weight[a] = append(weight[a], w)
-		adj[b] = append(adj[b], a)
-		weight[b] = append(weight[b], w)
-	}
-
 	// Cluster A: 0-1, 1-2, 0-2
-	addEdge(0, 1, 1)
-	addEdge(1, 2, 1)
-	addEdge(0, 2, 1)
+	addTestEdge(adj, weight, 0, 1, 1)
+	addTestEdge(adj, weight, 1, 2, 1)
+	addTestEdge(adj, weight, 0, 2, 1)
 
 	// Cluster B: 3-4, 4-5, 3-5
-	addEdge(3, 4, 1)
-	addEdge(4, 5, 1)
-	addEdge(3, 5, 1)
+	addTestEdge(adj, weight, 3, 4, 1)
+	addTestEdge(adj, weight, 4, 5, 1)
+	addTestEdge(adj, weight, 3, 5, 1)
 
 	totalWeight := 6.0 // 6 edges total (undirected, each counted once in totalWeight)
 
@@ -66,20 +68,13 @@ func TestLouvainLocalMovingWithMoves(t *testing.T) {
 	adj := make([][]int, n)
 	weight := make([][]float64, n)
 
-	addEdge := func(a, b int, w float64) {
-		adj[a] = append(adj[a], b)
-		weight[a] = append(weight[a], w)
-		adj[b] = append(adj[b], a)
-		weight[b] = append(weight[b], w)
-	}
-
-	addEdge(0, 1, 1)
-	addEdge(1, 2, 1)
-	addEdge(0, 2, 1)
-	addEdge(3, 4, 1)
-	addEdge(4, 5, 1)
-	addEdge(3, 5, 1)
-	addEdge(2, 3, 0.1) // weak bridge
+	addTestEdge(adj, weight, 0, 1, 1)
+	addTestEdge(adj, weight, 1, 2, 1)
+	addTestEdge(adj, weight, 0, 2, 1)
+	addTestEdge(adj, weight, 3, 4, 1)
+	addTestEdge(adj, weight, 4, 5, 1)
+	addTestEdge(adj, weight, 3, 5, 1)
+	addTestEdge(adj, weight, 2, 3, 0.1) // weak bridge
 
 	totalWeight := 6.1
 
@@ -161,11 +156,11 @@ func TestLouvainEarlyExitOnConvergence(t *testing.T) {
 	}
 }
 
-// TestLouvainFractionThreshold verifies that a large graph with mostly-converged
-// communities terminates due to the fraction < 0.001 early-exit condition.
-func TestLouvainFractionThreshold(t *testing.T) {
-	// Build a 20-node fully-connected graph — all nodes already well-connected,
-	// so after the first pass almost nothing moves, triggering the fraction threshold.
+// TestLouvainCompleteGraphTerminates verifies that louvain terminates on a
+// fully-connected graph and returns a valid partition. (Testing the fraction
+// threshold itself requires n > 1000; this test verifies absence of infinite loops.)
+func TestLouvainCompleteGraphTerminates(t *testing.T) {
+	// Build a 20-node fully-connected graph.
 	nodeCount := 20
 	var nodes []int64
 	var edges []louvainEdge

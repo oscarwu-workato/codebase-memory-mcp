@@ -225,7 +225,6 @@ func TestArchCacheConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 
 	for i := 0; i < goroutines; i++ {
-		i := i
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
