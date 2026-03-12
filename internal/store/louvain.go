@@ -39,23 +39,6 @@ func communityCount(partition map[int64]int) int {
 	return len(seen)
 }
 
-// LouvainEdge is an exported edge type for cross-package use of the Louvain algorithm.
-type LouvainEdge struct {
-	Src int64
-	Dst int64
-}
-
-// RunLouvain runs community detection with optional warm-start.
-// GPU acceleration (CBM_GPU=1) is wired in the full implementation;
-// this consolidation commit adds the cross-package interface only.
-func RunLouvain(nodes []int64, edges []LouvainEdge, warmStart map[int64]int) map[int64]int {
-	internal := make([]louvainEdge, len(edges))
-	for i, e := range edges {
-		internal[i] = louvainEdge{src: e.Src, dst: e.Dst}
-	}
-	return louvainWithWarmStart(nodes, internal, warmStart)
-}
-
 // louvainEdge represents an edge for the Louvain algorithm.
 type louvainEdge struct {
 	src      int64
