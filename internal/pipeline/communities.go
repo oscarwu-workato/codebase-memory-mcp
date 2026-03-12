@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"math"
@@ -10,9 +11,17 @@ import (
 )
 
 // communityGraphHash returns a fingerprint of the community graph state.
-// A change in node or edge count invalidates the warm-start cache.
-func communityGraphHash(nodeCount, edgeCount int) string {
-	return fmt.Sprintf("%d:%d", nodeCount, edgeCount)
+// Includes node count, edge count, and a checksum of node/edge IDs to detect
+// topology changes that preserve counts (e.g., one function deleted, another added).
+func communityGraphHash(allNodes map[int64]bool, callEdges []*store.Edge) string {
+	var nodeSum, edgeXOR uint64
+	for id := range allNodes {
+		nodeSum += uint64(id)
+	}
+	for _, e := range callEdges {
+		edgeXOR ^= uint64(e.SourceID) ^ uint64(e.TargetID)
+	}
+	return fmt.Sprintf("%d:%d:%x:%x", len(allNodes), len(callEdges), nodeSum, edgeXOR)
 }
 
 // passCommunities runs Louvain community detection on the CALLS graph
@@ -44,20 +53,20 @@ func (p *Pipeline) passCommunities() {
 	}
 
 	// Load warm-start partition from cache if graph fingerprint matches.
-	graphHash := communityGraphHash(len(allNodes), len(callEdges))
-	warmStart, err := p.Store.LoadCommunityCache(p.ProjectName, graphHash)
+	ctx := context.Background()
+	graphHash := communityGraphHash(allNodes, callEdges)
+	warmStart, err := p.Store.LoadCommunityCache(ctx, p.ProjectName, graphHash)
 	if err != nil {
 		slog.Warn("pass.communities.cache.load.err", "err", err)
 		warmStart = nil
 	}
-	cacheHit := warmStart != nil
-	slog.Info("pass.communities.cache", "hit", cacheHit, "hash", graphHash)
+	slog.Info("pass.communities.cache", "hit", warmStart != nil, "hash", graphHash)
 
 	// Run Louvain community detection
 	communities, nodeCommunity := louvainCommunities(adj, allNodes, warmStart)
 
 	// Persist the partition for warm-starting future runs.
-	if saveErr := p.Store.SaveCommunityCache(p.ProjectName, graphHash, nodeCommunity); saveErr != nil {
+	if saveErr := p.Store.SaveCommunityCache(ctx, p.ProjectName, graphHash, nodeCommunity); saveErr != nil {
 		slog.Warn("pass.communities.cache.save.err", "err", saveErr)
 	}
 

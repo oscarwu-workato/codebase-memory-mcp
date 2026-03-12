@@ -50,6 +50,11 @@ type Watcher struct {
 	// fallback poll state (snapshot comparison).
 	pollMu   sync.Mutex
 	projects map[string]*projectState
+
+	// Project list cache: refreshed on every poll, used by the hot-path
+	// handleFSEvent to avoid a DB round-trip on every filesystem event.
+	cachedProjectsMu sync.RWMutex
+	cachedProjects   []*store.ProjectInfo
 }
 
 // New creates a Watcher. indexFn is called when file changes are detected.
@@ -135,16 +140,32 @@ func (w *Watcher) runFallbackPoll(ctx context.Context) {
 	}
 }
 
-// watchAllProjects registers fsnotify watchers for all known indexed projects.
-func (w *Watcher) watchAllProjects() {
+// refreshProjectCache fetches the current project list from the router and
+// updates the in-memory cache. Returns the fresh list.
+func (w *Watcher) refreshProjectCache() []*store.ProjectInfo {
 	infos, err := w.router.ListProjects()
 	if err != nil {
 		slog.Warn("watcher.list_projects", "err", err)
-		return
+		return nil
 	}
+	w.cachedProjectsMu.Lock()
+	w.cachedProjects = infos
+	w.cachedProjectsMu.Unlock()
+	return infos
+}
+
+// watchAllProjects registers fsnotify watchers for all known indexed projects
+// and primes the poll-state map so pollAll does not re-register them.
+func (w *Watcher) watchAllProjects() {
+	infos := w.refreshProjectCache()
+	w.pollMu.Lock()
 	for _, info := range infos {
+		if _, seen := w.projects[info.Name]; !seen {
+			w.projects[info.Name] = &projectState{}
+		}
 		w.addProjectDirs(info.RootPath)
 	}
+	w.pollMu.Unlock()
 }
 
 // addProjectDirs recursively adds all subdirectories of rootPath to fsw.
@@ -169,11 +190,11 @@ func (w *Watcher) addProjectDirs(rootPath string) {
 }
 
 // projectForPath finds the indexed project whose RootPath is a prefix of path.
+// Uses the in-memory project cache to avoid a DB query on every fsnotify event.
 func (w *Watcher) projectForPath(path string) (*store.ProjectInfo, bool) {
-	infos, err := w.router.ListProjects()
-	if err != nil {
-		return nil, false
-	}
+	w.cachedProjectsMu.RLock()
+	infos := w.cachedProjects
+	w.cachedProjectsMu.RUnlock()
 	for _, info := range infos {
 		root := info.RootPath
 		if !strings.HasSuffix(root, string(filepath.Separator)) {
@@ -191,11 +212,23 @@ func (w *Watcher) projectForPath(path string) (*store.ProjectInfo, bool) {
 func (w *Watcher) triggerDebounced(ctx context.Context, proj *store.ProjectInfo) {
 	w.debounceMu.Lock()
 	if t, ok := w.debounceMap[proj.Name]; ok {
+		// Stop before Reset per Go docs to avoid racing on a fired timer.
+		t.Stop()
 		t.Reset(debounceWindow)
 	} else {
 		name := proj.Name
 		rootPath := proj.RootPath
 		w.debounceMap[proj.Name] = time.AfterFunc(debounceWindow, func() {
+			// Skip indexing if the watcher context was cancelled while the
+			// timer was pending (avoids error noise on graceful shutdown).
+			select {
+			case <-ctx.Done():
+				w.debounceMu.Lock()
+				delete(w.debounceMap, name)
+				w.debounceMu.Unlock()
+				return
+			default:
+			}
 			if err := w.indexFn(ctx, name, rootPath); err != nil {
 				slog.Warn("watcher.index", "project", name, "err", err)
 			}
@@ -209,9 +242,8 @@ func (w *Watcher) triggerDebounced(ctx context.Context, proj *store.ProjectInfo)
 
 // pollAll runs a snapshot comparison for all projects due for a fallback poll.
 func (w *Watcher) pollAll(ctx context.Context) {
-	projectInfos, err := w.router.ListProjects()
-	if err != nil {
-		slog.Warn("watcher.list_projects", "err", err)
+	projectInfos := w.refreshProjectCache()
+	if projectInfos == nil {
 		return
 	}
 
