@@ -11,13 +11,12 @@ const cacheBatchSize = 249
 
 // SaveCommunityCache persists the Louvain partition for a project in batched
 // multi-row INSERTs. graphHash is a fingerprint of the graph state.
+//
+// Uses s.q (the active Querier) rather than s.db so that callers inside a
+// write transaction (e.g. passCommunities inside WithTransaction + MEMORY
+// journal mode) don't deadlock by opening a second connection on the pool.
 func (s *Store) SaveCommunityCache(ctx context.Context, project, graphHash string, partition map[int64]int) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM community_cache WHERE project = ?`, project); err != nil {
-		_ = tx.Rollback()
+	if _, err := s.q.Exec(`DELETE FROM community_cache WHERE project = ?`, project); err != nil {
 		return err
 	}
 
@@ -45,22 +44,23 @@ func (s *Store) SaveCommunityCache(ctx context.Context, project, graphHash strin
 		}
 		q := "INSERT OR REPLACE INTO community_cache(project, node_id, community, graph_hash) VALUES " +
 			strings.Join(placeholders, ",")
-		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
-			_ = tx.Rollback()
+		if _, err := s.q.Exec(q, args...); err != nil {
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // LoadCommunityCache loads the previous Louvain partition for a project.
 // Returns nil if no cache exists or if graphHash doesn't match the stored hash.
+//
+// Uses s.q (the active Querier) rather than s.db so that callers inside a
+// write transaction (e.g. passCommunities inside WithTransaction + MEMORY
+// journal mode) don't deadlock by opening a second connection on the pool.
 func (s *Store) LoadCommunityCache(ctx context.Context, project, graphHash string) (map[int64]int, error) {
 	// Single query: filter by both project and graph_hash so an empty result
 	// set means cache miss (no need for a separate hash-check query).
-	// QueryContext never returns sql.ErrNoRows — zero rows appear as an empty
-	// result set (rows with no iterations), not as an error.
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.q.Query(
 		`SELECT node_id, community FROM community_cache WHERE project = ? AND graph_hash = ?`,
 		project, graphHash)
 	if err != nil {

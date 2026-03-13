@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,7 +19,32 @@ import (
 
 var version = "dev"
 
+// initTelemetry configures structured logging and pprof from environment variables.
+//
+//	CBM_LOG_FILE   path to append debug-level structured logs; empty = stderr at Info
+//	CBM_PPROF_ADDR host:port to serve net/http/pprof endpoints; empty = disabled
+//
+// Returns a cleanup func that flushes/closes the log file.
+func initTelemetry() func() {
+	cleanup := func() {}
+	if logPath := os.Getenv("CBM_LOG_FILE"); logPath != "" {
+		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err == nil {
+			h := slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug})
+			slog.SetDefault(slog.New(h))
+			cleanup = func() { _ = f.Close() }
+		}
+	}
+	if addr := os.Getenv("CBM_PPROF_ADDR"); addr != "" {
+		go func() { _ = http.ListenAndServe(addr, nil) }()
+	}
+	return cleanup
+}
+
 func main() {
+	cleanup := initTelemetry()
+	defer cleanup()
+
 	tools.SetVersion(version)
 
 	if len(os.Args) > 1 {

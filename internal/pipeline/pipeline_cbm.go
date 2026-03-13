@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/DeusData/codebase-memory-mcp/internal/cbm"
 	"github.com/DeusData/codebase-memory-mcp/internal/discover"
@@ -23,11 +24,21 @@ type cachedExtraction struct {
 // result to the same parseResult format used by the batch write infrastructure.
 // This replaces parseFileAST() — all AST walking happens in C.
 func cbmParseFile(projectName string, f discover.FileInfo) *parseResult {
+	slog.Debug("cbm.parse.start", "path", f.RelPath, "lang", f.Language, "size_kb", f.Size/1024)
+	t := time.Now()
 	source, cleanup, err := mmapFile(f.Path)
 	if cleanup != nil {
 		defer cleanup()
 	}
-	return cbmParseFileFromSource(projectName, f, source, err)
+	result := cbmParseFileFromSource(projectName, f, source, err)
+	elapsed := time.Since(t)
+	if elapsed > 200*time.Millisecond {
+		slog.Warn("cbm.parse.slow", "path", f.RelPath, "lang", f.Language,
+			"elapsed", elapsed, "size_kb", f.Size/1024)
+	} else {
+		slog.Debug("cbm.parse.done", "path", f.RelPath, "elapsed", elapsed)
+	}
+	return result
 }
 
 // cbmParseFileFromSource is like cbmParseFile but takes pre-read source data.
